@@ -1,0 +1,21 @@
+{
+  "id": "wingtheatre",
+  "name": "Wing Theatre Controller",
+  "shortname": "Wing Theatre",
+  "description": "Control Wing Theatre Controller for Behringer Wing show control.",
+  "manufacturer": "Mikkel Peter Larsen",
+  "products": ["Wing Theatre Controller"],
+  "keywords": ["wing", "behringer", "snapshots", "show control", "theatre"],
+  "version": "0.0.0",
+  "license": "MIT",
+  "repository": "git+https://github.com/mikk3722/wing-theatre-controller.git",
+  "bugs": "https://github.com/mikk3722/wing-theatre-controller/issues",
+  "maintainers": [{ "name": "Mikkel Peter Larsen", "email": "" }],
+  "legacyIds": [],
+  "runtime": {
+    "type": "node22",
+    "api": "nodejs-ipc",
+    "apiVersion": "0.0.0",
+    "entrypoint": "../main.js"
+  }
+}

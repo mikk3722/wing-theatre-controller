@@ -1,0 +1,17 @@
+{
+  "name": "companion-module-wingtheatre",
+  "version": "1.0.0",
+  "description": "Bitfocus Companion module for Wing Theatre Controller",
+  "keywords": ["companion-module"],
+  "main": "main.js",
+  "license": "MIT",
+  "author": "Mikkel Peter Larsen",
+  "engines": {
+    "node": "^22.20",
+    "yarn": "^4"
+  },
+  "dependencies": {
+    "@companion-module/base": "~1.12.1"
+  },
+  "packageManager": "yarn@4.10.3"
+}

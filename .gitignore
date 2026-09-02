@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.spec
+
+# PyInstaller output
+wing_theatre_dist/
+
+# Node
+node_modules/
+.yarn/cache/
+.yarn/unplugged/
+
+# macOS
+.DS_Store
+*.dmg
+
+# Windows
+*.exe.bak
+Thumbs.db
+
+# Show files (user data)
+*.wts
+
+# Rust
+target/
