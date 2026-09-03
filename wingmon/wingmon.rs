@@ -189,13 +189,27 @@ fn main() -> Result<(), libwing::Error> {
     });
 
     // Live event loop — main thread, runs forever
+    // On Windows, libwing may return timeout errors periodically — we ignore them
+    // and only exit on real connection failures
     loop {
-        match event_wing.read()? {
-            WingResponse::NodeData(id, data) => {
+        match event_wing.read() {
+            Ok(WingResponse::NodeData(id, data)) => {
                 print_node(&tx_out, "", id, &data.get_string());
             }
-            WingResponse::RequestEnd => {}
-            _ => {}
+            Ok(_) => {}
+            Err(e) => {
+                let s = e.to_string().to_lowercase();
+                if s.contains("timed out")
+                    || s.contains("timeout")
+                    || s.contains("wouldblock")
+                    || s.contains("resource temporarily unavailable") {
+                    // Transient timeout — keep running
+                    continue;
+                }
+                // Real error — log and exit
+                eprintln!("[wingmon] event_wing error: {}", e);
+                return Err(e);
+            }
         }
     }
 }
