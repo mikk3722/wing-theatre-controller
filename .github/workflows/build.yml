@@ -157,8 +157,10 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Install yarn
-        run: npm install -g yarn
+      - name: Enable Corepack + yarn 4
+     run: |
+       corepack enable
+       corepack prepare yarn@4.10.3 --activate
 
       - name: Install companion module deps
         run: |
