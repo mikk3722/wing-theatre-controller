@@ -72,10 +72,18 @@ jobs:
       - name: Build app
         run: |
           chmod +x wingmon-macos
+          # Write version file
+          echo "${{ github.ref_name }} (build ${{ github.run_number }}, $(date +%Y-%m-%d))" > version.txt
+          # Copy propmap from libwing
+          git clone https://github.com/dannyfiresnake/libwing.git libwing_tmp
+          cp libwing_tmp/propmap.jsonl propmap.jsonl || echo "propmap not found, skipping"
+          rm -rf libwing_tmp
           pyinstaller \
             --name "Wing Theatre Controller" \
             --windowed \
             --add-data "wingmon-macos:." \
+            --add-data "propmap.jsonl:." \
+            --add-data "version.txt:." \
             --hidden-import PyQt6.sip \
             --hidden-import pythonosc \
             wing_theatre.py
@@ -113,10 +121,18 @@ jobs:
 
       - name: Build app
         run: |
+          # Write version file
+          "${{ github.ref_name }} (build ${{ github.run_number }}, $(Get-Date -Format 'yyyy-MM-dd'))" | Out-File -FilePath version.txt -Encoding utf8
+          # Copy propmap from libwing
+          git clone https://github.com/dannyfiresnake/libwing.git libwing_tmp
+          Copy-Item libwing_tmp/propmap.jsonl propmap.jsonl -ErrorAction SilentlyContinue
+          Remove-Item libwing_tmp -Recurse -Force
           pyinstaller `
             --name "Wing Theatre Controller" `
             --windowed `
             --add-data "wingmon.exe;." `
+            --add-data "propmap.jsonl;." `
+            --add-data "version.txt;." `
             --hidden-import PyQt6.sip `
             --hidden-import pythonosc `
             wing_theatre.py

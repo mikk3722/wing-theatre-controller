@@ -621,6 +621,24 @@ class RemoteTCPServer(QObject):
 
 
 
+def _find_propmap_path():
+    """Find propmap.jsonl — works in dev, PyInstaller bundle, and cross-platform."""
+    import sys, os
+    # 1. PyInstaller bundle
+    if hasattr(sys, '_MEIPASS'):
+        p = os.path.join(sys._MEIPASS, 'propmap.jsonl')
+        if os.path.exists(p): return p
+    # 2. Same folder as script/exe
+    base = os.path.dirname(os.path.abspath(
+        sys.executable if getattr(sys, 'frozen', False) else __file__))
+    p = os.path.join(base, 'propmap.jsonl')
+    if os.path.exists(p): return p
+    # 3. Mac dev path
+    p = os.path.expanduser('~/WingTheatre/libwing/propmap.jsonl')
+    if os.path.exists(p): return p
+    return os.path.join(base, 'propmap.jsonl')
+
+
 def _find_wingmon_path():
     """Find wingmon binary — works in dev, PyInstaller, Windows and macOS."""
     import sys, os, shutil
@@ -664,7 +682,7 @@ class WingOSC(QObject):
     sync_complete      = pyqtSignal(int)   # initial state sync done (param count)
     WING_PORT    = 2223
     WINGMON_PATH = _find_wingmon_path()
-    PROPMAP_PATH   = os.path.expanduser('~/WingTheatre/libwing/propmap.jsonl')
+    PROPMAP_PATH   = _find_propmap_path()
     POLL_PARAMS = [
         # Fader / Mute / Pan / Width
         ("fader",    "/fdr"),
@@ -902,27 +920,32 @@ class WingOSC(QObject):
             # On macOS, adding a host route fixes the issue when both WiFi and
             # Ethernet are active. Silently ignored if route already exists.
             env = os.environ.copy()
-            if self.local_ip and self.local_ip != "0.0.0.0":
+            if self.local_ip and self.local_ip != "0.0.0.0" and sys.platform != 'win32':
                 try:
                     iface_name = self._get_iface_name(self.local_ip)
                     if iface_name:
-                        # Add host route through the correct interface
                         subprocess.run(
                             ['route', 'add', '-host', self.ip,
                              '-interface', iface_name],
                             capture_output=True, timeout=3)
-                        env['BIND_ADDR'] = self.local_ip  # some builds respect this
+                        env['BIND_ADDR'] = self.local_ip
                         self.log_message.emit(
                             f"Route set: {self.ip} -> {iface_name} ({self.local_ip})")
                 except Exception:
                     pass
 
             cmd = [self.WINGMON_PATH, '-h', self.ip]   # -h = direct TCP, no WiFi discovery
-            self._wingmon_proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,   # bidirectional: send SET/GET
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+
+            # Hide console window on Windows
+            popen_kwargs = dict(
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True, bufsize=1, env=env)
+            if sys.platform == 'win32':
+                popen_kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+
+            self._wingmon_proc = subprocess.Popen(cmd, **popen_kwargs)
             # Check for immediate failure (e.g. DiscoveryError)
             import time; time.sleep(0.4)
             if self._wingmon_proc.poll() is not None:
@@ -4323,6 +4346,95 @@ class OscServer(QObject):
         self.addsnap.emit(name)
 
 
+def _get_version():
+    """Read version from version.txt (written by GitHub Actions) or return default."""
+    import os
+    # Check next to executable (PyInstaller) or script
+    for base in [
+        os.path.dirname(os.path.abspath(
+            __import__('sys').executable if getattr(__import__('sys'), 'frozen', False)
+            else __file__)),
+        getattr(__import__('sys'), '_MEIPASS', None),
+    ]:
+        if base:
+            p = os.path.join(base, 'version.txt')
+            if os.path.exists(p):
+                try: return open(p).read().strip()
+                except: pass
+    return "dev"
+
+
+class AboutDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("About Wing Theatre Controller")
+        self.setFixedSize(420, 320)
+        self.setStyleSheet(f"background:{C['bg2']};color:{C['text']};")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(32, 28, 32, 24)
+        layout.setSpacing(10)
+
+        # Title
+        title = QLabel("Wing Theatre Controller")
+        title.setStyleSheet(f"font-size:18px;font-weight:bold;color:{C['text']};")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+
+        # Version
+        version = _get_version()
+        ver_lbl = QLabel(f"Version {version}")
+        ver_lbl.setStyleSheet(f"font-size:13px;color:{C['text3']};")
+        ver_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(ver_lbl)
+
+        layout.addSpacing(8)
+
+        # Description
+        desc = QLabel("Professional show-control software\nfor Behringer Wing mixer.")
+        desc.setStyleSheet(f"font-size:12px;color:{C['text2']};")
+        desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(desc)
+
+        layout.addSpacing(8)
+
+        # Credits
+        credits = QLabel(
+            "<b>Developers:</b><br>"
+            "Mikkel Peter Larsen &amp; Claude (Anthropic)<br><br>"
+            "<b>Credits:</b><br>"
+            "wingmon built on <i>libwing</i> by dannyfiresnake<br>"
+            "Protocol documentation by Patrick-Gilles Maillot<br>"
+            "python-osc by attwad · PyQt6 by Riverbank Computing"
+        )
+        credits.setStyleSheet(f"font-size:11px;color:{C['text3']};")
+        credits.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        credits.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(credits)
+
+        layout.addSpacing(8)
+
+        # GitHub link
+        link = QLabel('<a href="https://github.com/mikk3722/wing-theatre-controller" '
+                     f'style="color:{C["green"]};">github.com/mikk3722/wing-theatre-controller</a>')
+        link.setOpenExternalLinks(True)
+        link.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        link.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(link)
+
+        layout.addStretch()
+
+        # Close button
+        btn = QPushButton("Close")
+        btn.setFixedWidth(100)
+        btn.clicked.connect(self.accept)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_row.addWidget(btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -4355,6 +4467,16 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Wing Theatre Controller")
         self.resize(1400,860); self.setMinimumSize(1000,640)
         tb = QToolBar(); tb.setMovable(False); self.addToolBar(tb)
+
+        # About button
+        about_btn = QPushButton("?")
+        about_btn.setFixedSize(26, 26)
+        about_btn.setStyleSheet(
+            f"background:{C['bg3']};color:{C['text3']};border:1px solid {C['border']};"
+            f"border-radius:13px;font-weight:bold;")
+        about_btn.setToolTip("About Wing Theatre Controller")
+        about_btn.clicked.connect(lambda: AboutDialog(self).exec())
+        tb.addWidget(about_btn)
         tb.addAction("New Show",    self._new_show)
         tb.addAction("Open...",     self._open_show)
         tb.addAction("Save",        self._save_show)
