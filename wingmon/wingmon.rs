@@ -188,27 +188,29 @@ fn main() -> Result<(), libwing::Error> {
         }
     });
 
-    // Live event loop — main thread, runs forever
-    // On Windows, libwing may return timeout errors periodically — we ignore them
-    // and only exit on real connection failures
+    // Live event loop — main thread
+    // libwing may return periodic timeout errors (especially on Windows).
+    // We only disconnect after 10+ consecutive errors (= real disconnection).
+    let mut consecutive_errors = 0u32;
     loop {
         match event_wing.read() {
             Ok(WingResponse::NodeData(id, data)) => {
+                consecutive_errors = 0;
                 print_node(&tx_out, "", id, &data.get_string());
             }
-            Ok(_) => {}
+            Ok(_) => {
+                consecutive_errors = 0;
+            }
             Err(e) => {
-                let s = e.to_string().to_lowercase();
-                if s.contains("timed out")
-                    || s.contains("timeout")
-                    || s.contains("wouldblock")
-                    || s.contains("resource temporarily unavailable") {
-                    // Transient timeout — keep running
-                    continue;
+                consecutive_errors += 1;
+                eprintln!("[wingmon] event_wing error #{}: {}", consecutive_errors, e);
+                if consecutive_errors > 10 {
+                    eprintln!("[wingmon] too many consecutive errors — disconnecting");
+                    return Err(e);
                 }
-                // Real error — log and exit
-                eprintln!("[wingmon] event_wing error: {}", e);
-                return Err(e);
+                // Brief pause before retry
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                continue;
             }
         }
     }
