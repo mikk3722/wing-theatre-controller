@@ -2,7 +2,7 @@ mod utils;
 use utils::Args;
 use std::result::Result;
 use std::io::{BufRead, Write};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use libwing::{WingConsole, WingResponse};
 
 fn print_node(tx: &mpsc::Sender<String>, prefix: &str, id: i32, val: &str) {
@@ -24,6 +24,16 @@ fn print_node(tx: &mpsc::Sender<String>, prefix: &str, id: i32, val: &str) {
     }
 }
 
+fn connect_cmd(host: Option<&str>) -> Option<WingConsole> {
+    for _ in 0..20 {
+        match WingConsole::connect(host) {
+            Ok(mut c) => { c.keep_alive().ok(); return Some(c); }
+            Err(_)    => { std::thread::sleep(std::time::Duration::from_millis(500)); }
+        }
+    }
+    None
+}
+
 fn main() -> Result<(), libwing::Error> {
     let mut args = Args::new("Usage: wingmon [-h host]\n   -h host : Wing IP");
     let mut host: Option<String> = None;
@@ -34,18 +44,19 @@ fn main() -> Result<(), libwing::Error> {
         }
     }
 
+    // stdout channel — single writer thread flushes after every message
     let (tx, rx) = mpsc::channel::<String>();
     std::thread::spawn(move || {
         let mut out = std::io::BufWriter::new(std::io::stdout());
         for msg in rx { let _ = writeln!(out, "{}", msg); let _ = out.flush(); }
     });
 
-    // Connection 1: event_wing — SYNC + live events (blocking reads, no timeout)
+    // Connection 1: event_wing — SYNC + live events
     let mut event_wing = WingConsole::connect(host.as_deref())?;
     eprintln!("[wingmon] Connected!");
     tx.send("Connected!".to_string()).ok();
 
-    // SYNC on event_wing — subscribes us to all nodes
+    // SYNC
     let sync_paths: Vec<String> =
         (1..=48).map(|i| format!("/ch/{}", i))
         .chain((1..=16).map(|i| format!("/bus/{}", i)))
@@ -76,79 +87,93 @@ fn main() -> Result<(), libwing::Error> {
         }
     }
     tx.send(format!("SYNC_COMPLETE {}", total)).ok();
-    eprintln!("[wingmon] SYNC done: {} params. event_wing now receives all live events.", total);
+    eprintln!("[wingmon] SYNC done: {} params.", total);
 
-    // Connection 2: cmd_wing — SET/KEEPALIVE only, NEVER reads
-    // Does NOT call request_node_data so event subscriptions stay on event_wing
-    let host2 = host.clone();
+    // Connection 2: cmd_wing — shared between stdin thread and keepalive thread
+    let cmd_shared: Arc<Mutex<Option<WingConsole>>> = Arc::new(Mutex::new(None));
+
+    // Initial connect
+    {
+        let mut g = cmd_shared.lock().unwrap();
+        eprintln!("[wingmon] cmd_wing connecting...");
+        *g = connect_cmd(host.as_deref());
+        if g.is_some() { eprintln!("[wingmon] cmd_wing connected"); }
+    }
+
+    // Keepalive thread — fires every 4s regardless of stdin state
+    // Keeps Wing from dropping cmd_wing even if stdin is EOF (PyInstaller windowed mode)
+    let ka_cmd  = Arc::clone(&cmd_shared);
+    let ka_host = host.clone();
     std::thread::spawn(move || {
-        // Buffer commands while connecting/reconnecting
-        let stdin = std::io::stdin();
-        let mut cmd_opt: Option<WingConsole> = None;
-
-        // Connect with retry
         loop {
-            match WingConsole::connect(host2.as_deref()) {
-                Ok(c) => { eprintln!("[wingmon] cmd_wing connected"); let mut c = c; c.keep_alive().ok(); cmd_opt = Some(c); break; }
-                Err(e) => { eprintln!("[wingmon] cmd_wing connect failed: {}", e); std::thread::sleep(std::time::Duration::from_millis(500)); }
+            std::thread::sleep(std::time::Duration::from_secs(4));
+            let mut g = cmd_shared.lock().unwrap();
+            let ok = g.as_mut().map(|c| c.keep_alive().is_ok()).unwrap_or(false);
+            if !ok {
+                eprintln!("[wingmon] cmd_wing keepalive reconnect...");
+                *g = connect_cmd(ka_host.as_deref());
+                if g.is_some() { eprintln!("[wingmon] cmd_wing reconnected"); }
             }
         }
+    });
+    // move ka_cmd back to actually use it (Rust borrow)
+    let _ = ka_cmd;
 
+    // stdin command thread — handles SET/BATCH_SET/KEEPALIVE from Python
+    let si_cmd  = Arc::clone(&cmd_shared);
+    let si_host = host.clone();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
             let Ok(l) = line else { break };
             let trimmed = l.trim();
-            if cmd_opt.is_none() { continue; }
-
+            let mut g = si_cmd.lock().unwrap();
             let mut reconnect = false;
-            {
-                let cmd = cmd_opt.as_mut().unwrap();
 
+            if let Some(ref mut cmd) = *g {
                 if let Some(params) = trimmed.strip_prefix("BATCH_SET ") {
-                    // strip_prefix avoids splitn issues with spaces in string values (names)
                     for param in params.split(',') {
                         if let Some((path, val)) = param.split_once('=') {
                             if let Some(id) = WingConsole::name_to_id(path.trim()) {
                                 let t = val.trim();
-                                let result = if let Ok(i) = t.parse::<i32>()      { cmd.set_int(id, i) }
-                                             else if let Ok(f) = t.parse::<f32>() { cmd.set_float(id, f) }
-                                             else                                  { cmd.set_string(id, t) };
-                                if result.is_err() { reconnect = true; break; }
+                                let r = if let Ok(i) = t.parse::<i32>()      { cmd.set_int(id, i) }
+                                        else if let Ok(f) = t.parse::<f32>() { cmd.set_float(id, f) }
+                                        else                                  { cmd.set_string(id, t) };
+                                if r.is_err() { reconnect = true; break; }
                             }
                         }
                     }
                 } else if let Some(rest) = trimmed.strip_prefix("SET ") {
-                    // SET path value — value may contain spaces (channel names)
                     if let Some(space) = rest.find(' ') {
                         let path = &rest[..space];
                         let val  = rest[space+1..].trim();
                         if let Some(id) = WingConsole::name_to_id(path) {
-                            let result = if let Ok(i) = val.parse::<i32>()      { cmd.set_int(id, i) }
-                                         else if let Ok(f) = val.parse::<f32>() { cmd.set_float(id, f) }
-                                         else                                    { cmd.set_string(id, val) };
-                            if let Err(e) = result {
-                                eprintln!("[wingmon] SET error: {} — reconnecting", e);
-                                reconnect = true;
-                            }
+                            let r = if let Ok(i) = val.parse::<i32>()      { cmd.set_int(id, i) }
+                                    else if let Ok(f) = val.parse::<f32>() { cmd.set_float(id, f) }
+                                    else                                    { cmd.set_string(id, val) };
+                            if r.is_err() { reconnect = true; }
                         }
                     }
                 } else if trimmed == "KEEPALIVE" {
-                    cmd.keep_alive().ok();
+                    if cmd.keep_alive().is_err() { reconnect = true; }
                 }
-            } // cmd borrow ends here
+            } else {
+                reconnect = true;
+            }
+
             if reconnect {
                 eprintln!("[wingmon] cmd_wing reconnecting...");
-                cmd_opt = WingConsole::connect(host2.as_deref()).ok();
-                if cmd_opt.is_some() { eprintln!("[wingmon] cmd_wing reconnected"); }
+                *g = connect_cmd(si_host.as_deref());
+                if g.is_some() { eprintln!("[wingmon] cmd_wing reconnected"); }
             }
         }
+        eprintln!("[wingmon] stdin EOF — internal keepalive maintains connection");
     });
 
-    // Live event loop on event_wing — blocking, no timeout
+    // Live event loop — main thread
     loop {
         match event_wing.read()? {
-            WingResponse::NodeData(id, data) => {
-                print_node(&tx, "", id, &data.get_string());
-            }
+            WingResponse::NodeData(id, data) => { print_node(&tx, "", id, &data.get_string()); }
             WingResponse::RequestEnd => {}
             _ => {}
         }
