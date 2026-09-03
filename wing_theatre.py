@@ -946,6 +946,18 @@ class WingOSC(QObject):
                 popen_kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
 
             self._wingmon_proc = subprocess.Popen(cmd, **popen_kwargs)
+
+            # Stream wingmon stderr to log in real-time (shows errors on Windows)
+            def _stderr_reader():
+                try:
+                    for line in self._wingmon_proc.stderr:
+                        line = line.strip()
+                        if line:
+                            self.log_message.emit(f"[wingmon] {line}")
+                except Exception:
+                    pass
+            threading.Thread(target=_stderr_reader, daemon=True,
+                           name="wingmon-stderr").start()
             # Check for immediate failure (e.g. DiscoveryError)
             import time; time.sleep(0.4)
             if self._wingmon_proc.poll() is not None:
@@ -4975,19 +4987,24 @@ class MainWindow(QMainWindow):
         })
 
     def _tcp_send_cue_state(self):
-        """Send current/next cue state after GO."""
-        snaps = self.show_file.snapshots
-        idx   = self.active_cue_index
-        count = len(snaps)
-        cur_num  = f"{snaps[idx].number:03d}" if 0 <= idx < count else ""
-        cur_name = snaps[idx].name            if 0 <= idx < count else ""
-        nxt_idx  = idx + 1
+        """Send current/next/selected cue state."""
+        snaps  = self.show_file.snapshots
+        active = self.active_cue_index
+        sel    = self.cue_panel.current_index
+        count  = len(snaps)
+        cur_num  = f"{snaps[active].number:03d}" if 0 <= active < count else ""
+        cur_name = snaps[active].name            if 0 <= active < count else ""
+        nxt_idx  = sel + 1  # next = one after selection
         nxt_num  = f"{snaps[nxt_idx].number:03d}" if 0 <= nxt_idx < count else ""
         nxt_name = snaps[nxt_idx].name            if 0 <= nxt_idx < count else ""
+        sel_num  = f"{snaps[sel].number:03d}" if 0 <= sel < count else ""
+        sel_name = snaps[sel].name            if 0 <= sel < count else ""
         self.tcp_server.send_state("current_cue_num",  cur_num)
         self.tcp_server.send_state("current_cue_name", cur_name)
         self.tcp_server.send_state("next_cue_num",     nxt_num)
         self.tcp_server.send_state("next_cue_name",    nxt_name)
+        self.tcp_server.send_state("selected_cue_num", sel_num)
+        self.tcp_server.send_state("selected_cue_name",sel_name)
         self.tcp_server.send_state("cue_count",        str(count))
 
     def _on_tcp_command(self, cmd: str):
@@ -5037,6 +5054,12 @@ class MainWindow(QMainWindow):
                 self._osc_addsnap(name)
             else:
                 self._osc_addsnap("")
+        elif cmd == "NEXT":
+            self.cue_panel.go_next()
+            self._tcp_send_cue_state()
+        elif cmd == "PREV":
+            self.cue_panel.go_prev()
+            self._tcp_send_cue_state()
         elif cmd == "GET_STATE":
             self._tcp_send_full_state()
 
