@@ -621,6 +621,28 @@ class RemoteTCPServer(QObject):
 
 
 
+def _find_wingmon_path():
+    """Find wingmon binary — works in dev, PyInstaller, Windows and macOS."""
+    import sys, os, shutil
+    exe_name = 'wingmon.exe' if sys.platform == 'win32' else 'wingmon'
+    # 1. PyInstaller bundle
+    if hasattr(sys, '_MEIPASS'):
+        p = os.path.join(sys._MEIPASS, exe_name)
+        if os.path.exists(p): return p
+    # 2. Same folder as script/exe
+    base = os.path.dirname(os.path.abspath(
+        sys.executable if getattr(sys, 'frozen', False) else __file__))
+    p = os.path.join(base, exe_name)
+    if os.path.exists(p): return p
+    # 3. Mac dev path
+    p = os.path.expanduser(f'~/WingTheatre/{exe_name}')
+    if os.path.exists(p): return p
+    # 4. System PATH
+    p = shutil.which(exe_name)
+    if p: return p
+    return os.path.join(base, exe_name)  # fallback for error message
+
+
 class WingOSC(QObject):
     """
     Behringer Wing OSC engine -- firmware 3.x / port 2223 UDP.
@@ -641,39 +663,7 @@ class WingOSC(QObject):
     capture_finished   = pyqtSignal()   # emitted from wingmon thread -> finish on main
     sync_complete      = pyqtSignal(int)   # initial state sync done (param count)
     WING_PORT    = 2223
-    # Find wingmon binary — works in dev, PyInstaller bundle, and cross-platform
-    @staticmethod
-    def _find_wingmon():
-        import sys, os
-        exe_name = 'wingmon.exe' if sys.platform == 'win32' else 'wingmon'
-
-        # 1. PyInstaller bundle: files extracted to sys._MEIPASS
-        if hasattr(sys, '_MEIPASS'):
-            p = os.path.join(sys._MEIPASS, exe_name)
-            if os.path.exists(p):
-                return p
-
-        # 2. Same folder as the running script/exe
-        base = os.path.dirname(os.path.abspath(
-            sys.executable if getattr(sys, 'frozen', False) else __file__))
-        p = os.path.join(base, exe_name)
-        if os.path.exists(p):
-            return p
-
-        # 3. Mac dev path
-        p = os.path.expanduser(f'~/WingTheatre/{exe_name}')
-        if os.path.exists(p):
-            return p
-
-        # 4. PATH
-        import shutil
-        p = shutil.which(exe_name)
-        if p:
-            return p
-
-        return os.path.join(base, exe_name)  # fallback for error message
-
-    WINGMON_PATH = _find_wingmon.__func__(_find_wingmon)
+    WINGMON_PATH = _find_wingmon_path()
     PROPMAP_PATH   = os.path.expanduser('~/WingTheatre/libwing/propmap.jsonl')
     POLL_PARAMS = [
         # Fader / Mute / Pan / Width
