@@ -147,7 +147,7 @@ jobs:
       - name: Install companion module deps
         run: |
           cd companion-module
-          corepack yarn install
+          corepack yarn install --no-immutable
 
       - name: Package companion module
         run: zip -r companion-module-wingtheatre.zip companion-module/
