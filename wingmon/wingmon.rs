@@ -2,7 +2,7 @@ mod utils;
 use utils::Args;
 use std::result::Result;
 use std::io::{BufRead, Write};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::mpsc;
 use libwing::{WingConsole, WingResponse};
 
 fn print_node(tx: &mpsc::Sender<String>, prefix: &str, id: i32, val: &str) {
@@ -24,16 +24,6 @@ fn print_node(tx: &mpsc::Sender<String>, prefix: &str, id: i32, val: &str) {
     }
 }
 
-fn connect_cmd(host: Option<&str>) -> Option<WingConsole> {
-    for _ in 0..20 {
-        match WingConsole::connect(host) {
-            Ok(mut c) => { c.keep_alive().ok(); return Some(c); }
-            Err(_)    => { std::thread::sleep(std::time::Duration::from_millis(500)); }
-        }
-    }
-    None
-}
-
 fn main() -> Result<(), libwing::Error> {
     let mut args = Args::new("Usage: wingmon [-h host]\n   -h host : Wing IP");
     let mut host: Option<String> = None;
@@ -44,17 +34,20 @@ fn main() -> Result<(), libwing::Error> {
         }
     }
 
-    // stdout channel — single writer thread flushes after every message
-    let (tx, rx) = mpsc::channel::<String>();
+    // stdout channel — single writer thread with explicit flush after each message
+    let (tx_out, rx_out) = mpsc::channel::<String>();
     std::thread::spawn(move || {
         let mut out = std::io::BufWriter::new(std::io::stdout());
-        for msg in rx { let _ = writeln!(out, "{}", msg); let _ = out.flush(); }
+        for msg in rx_out {
+            let _ = writeln!(out, "{}", msg);
+            let _ = out.flush();
+        }
     });
 
     // Connection 1: event_wing — SYNC + live events
     let mut event_wing = WingConsole::connect(host.as_deref())?;
     eprintln!("[wingmon] Connected!");
-    tx.send("Connected!".to_string()).ok();
+    tx_out.send("Connected!".to_string()).ok();
 
     // SYNC
     let sync_paths: Vec<String> =
@@ -79,58 +72,69 @@ fn main() -> Result<(), libwing::Error> {
             match event_wing.read() {
                 Ok(WingResponse::RequestEnd)         => { pending -= 1; }
                 Ok(WingResponse::NodeData(id, data)) => {
-                    print_node(&tx, "DATA ", id, &data.get_string());
+                    print_node(&tx_out, "DATA ", id, &data.get_string());
                     total += 1;
                 }
                 Ok(_) | Err(_) => {}
             }
         }
     }
-    tx.send(format!("SYNC_COMPLETE {}", total)).ok();
+    tx_out.send(format!("SYNC_COMPLETE {}", total)).ok();
     eprintln!("[wingmon] SYNC done: {} params.", total);
 
-    // Connection 2: cmd_wing — shared between stdin thread and keepalive thread
-    let cmd_shared: Arc<Mutex<Option<WingConsole>>> = Arc::new(Mutex::new(None));
+    // cmd channel: all commands go through here (from stdin thread + keepalive thread)
+    let (tx_cmd, rx_cmd) = mpsc::channel::<String>();
 
-    // Initial connect
-    {
-        let mut g = cmd_shared.lock().unwrap();
-        eprintln!("[wingmon] cmd_wing connecting...");
-        *g = connect_cmd(host.as_deref());
-        if g.is_some() { eprintln!("[wingmon] cmd_wing connected"); }
-    }
-
-    // Keepalive thread — fires every 4s regardless of stdin state
-    // Keeps Wing from dropping cmd_wing even if stdin is EOF (PyInstaller windowed mode)
-    let ka_cmd  = Arc::clone(&cmd_shared);
-    let ka_host = host.clone();
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(4));
-            let mut g = cmd_shared.lock().unwrap();
-            let ok = g.as_mut().map(|c| c.keep_alive().is_ok()).unwrap_or(false);
-            if !ok {
-                eprintln!("[wingmon] cmd_wing keepalive reconnect...");
-                *g = connect_cmd(ka_host.as_deref());
-                if g.is_some() { eprintln!("[wingmon] cmd_wing reconnected"); }
-            }
-        }
-    });
-    // move ka_cmd back to actually use it (Rust borrow)
-    let _ = ka_cmd;
-
-    // stdin command thread — handles SET/BATCH_SET/KEEPALIVE from Python
-    let si_cmd  = Arc::clone(&cmd_shared);
-    let si_host = host.clone();
+    // Stdin thread: forwards Python commands to cmd channel
+    // If stdin is EOF (PyInstaller windowed mode), thread exits silently —
+    // keepalive thread keeps the connection alive regardless
+    let tx_stdin = tx_cmd.clone();
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
             let Ok(l) = line else { break };
+            tx_stdin.send(l).ok();
+        }
+        eprintln!("[wingmon] stdin EOF — internal keepalive maintains connection");
+    });
+
+    // Internal keepalive thread: sends KEEPALIVE every 4s
+    // Ensures Wing never drops cmd_wing even without Python stdin
+    let tx_ka = tx_cmd.clone();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(4));
+            if tx_ka.send("KEEPALIVE".to_string()).is_err() { break; }
+        }
+    });
+
+    // cmd_wing thread: single owner of WingConsole, no Send required
+    let host2 = host.clone();
+    std::thread::spawn(move || {
+        let mut cmd_opt: Option<WingConsole> = None;
+
+        // Initial connect with retry
+        loop {
+            match WingConsole::connect(host2.as_deref()) {
+                Ok(mut c) => {
+                    eprintln!("[wingmon] cmd_wing connected");
+                    c.keep_alive().ok();
+                    cmd_opt = Some(c);
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("[wingmon] cmd_wing connect failed: {}", e);
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
+        }
+
+        // Process all commands from channel (stdin + internal keepalive)
+        for l in rx_cmd {
             let trimmed = l.trim();
-            let mut g = si_cmd.lock().unwrap();
             let mut reconnect = false;
 
-            if let Some(ref mut cmd) = *g {
+            if let Some(ref mut cmd) = cmd_opt {
                 if let Some(params) = trimmed.strip_prefix("BATCH_SET ") {
                     for param in params.split(',') {
                         if let Some((path, val)) = param.split_once('=') {
@@ -151,7 +155,10 @@ fn main() -> Result<(), libwing::Error> {
                             let r = if let Ok(i) = val.parse::<i32>()      { cmd.set_int(id, i) }
                                     else if let Ok(f) = val.parse::<f32>() { cmd.set_float(id, f) }
                                     else                                    { cmd.set_string(id, val) };
-                            if r.is_err() { reconnect = true; }
+                            if r.is_err() {
+                                eprintln!("[wingmon] SET error — reconnecting");
+                                reconnect = true;
+                            }
                         }
                     }
                 } else if trimmed == "KEEPALIVE" {
@@ -163,17 +170,30 @@ fn main() -> Result<(), libwing::Error> {
 
             if reconnect {
                 eprintln!("[wingmon] cmd_wing reconnecting...");
-                *g = connect_cmd(si_host.as_deref());
-                if g.is_some() { eprintln!("[wingmon] cmd_wing reconnected"); }
+                cmd_opt = None;
+                loop {
+                    match WingConsole::connect(host2.as_deref()) {
+                        Ok(mut c) => {
+                            c.keep_alive().ok();
+                            cmd_opt = Some(c);
+                            eprintln!("[wingmon] cmd_wing reconnected");
+                            break;
+                        }
+                        Err(_) => {
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                        }
+                    }
+                }
             }
         }
-        eprintln!("[wingmon] stdin EOF — internal keepalive maintains connection");
     });
 
-    // Live event loop — main thread
+    // Live event loop — main thread, runs forever
     loop {
         match event_wing.read()? {
-            WingResponse::NodeData(id, data) => { print_node(&tx, "", id, &data.get_string()); }
+            WingResponse::NodeData(id, data) => {
+                print_node(&tx_out, "", id, &data.get_string());
+            }
             WingResponse::RequestEnd => {}
             _ => {}
         }
