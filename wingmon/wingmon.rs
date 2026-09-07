@@ -267,7 +267,6 @@ fn main() -> Result<(), libwing::Error> {
                         c.keep_alive().ok();
                         cmd_opt = Some(c);
                         dead_count = 0;
-                        c.set_nodelay();
                         eprintln!("[wingmon] cmd_wing reconnected");
                         ok = true;
                         break;
