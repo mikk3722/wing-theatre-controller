@@ -94,9 +94,9 @@ fn main() -> Result<(), libwing::Error> {
 
     // Connection 1: event_wing — SYNC + live events
     let mut event_wing = WingConsole::connect(host.as_deref())?;
-    // Disable libwing's short read timeout (causes spurious OS 10060 on Windows).
-    // Instead we rely on TCP keepalives to detect real disconnections quickly.
-    event_wing.set_read_timeout(86400).ok(); // 24h ≈ blocking read
+    // Override libwing's short read timeout — prevents spurious OS 10060 on Windows.
+    // Real disconnections are detected via cmd_wing keepalive failures instead.
+    event_wing.set_read_timeout_secs(86400); // 24h ≈ blocking
     eprintln!("[wingmon] Connected!");
     tx_out.send("Connected!".to_string()).ok();
 
