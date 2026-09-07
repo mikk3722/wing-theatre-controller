@@ -96,7 +96,7 @@ fn main() -> Result<(), libwing::Error> {
     let mut event_wing = WingConsole::connect(host.as_deref())?;
     // Override libwing's short read timeout - prevents spurious OS 10060 on Windows.
     // Real disconnections are detected via cmd_wing keepalive failures instead.
-    event_wing.set_read_timeout_secs(86400); // 24h ~ blocking
+    event_wing.set_read_timeout_secs(60); // periodic wake-up so we can send keepalive
     eprintln!("[wingmon] Connected!");
     tx_out.send("Connected!".to_string()).ok();
 
@@ -161,7 +161,7 @@ fn main() -> Result<(), libwing::Error> {
     });
 
     // cmd_wing thread - single owner of cmd WingConsole
-    // Also health monitor: repeated keepalive failures = Wing is gone → DEAD signal
+    // Also health monitor: repeated keepalive failures = Wing is gone -> DEAD signal
     let host2 = host.clone();
     std::thread::spawn(move || {
         let mut cmd_opt: Option<WingConsole> = None;
@@ -240,7 +240,7 @@ fn main() -> Result<(), libwing::Error> {
                 if !ok {
                     dead_count += 1;
                     eprintln!("[wingmon] cmd_wing reconnect failed ({})", dead_count);
-                    // 5 failed reconnects ~ 7.5s → Wing is truly gone
+                    // 5 failed reconnects ~ 7.5s -> Wing is truly gone
                     if dead_count >= 5 {
                         eprintln!("[wingmon] Wing appears dead - signalling disconnect");
                         wing_dead_cmd.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -252,9 +252,12 @@ fn main() -> Result<(), libwing::Error> {
     });
 
 
-    // Live event loop - blocks on read() until Wing sends data.
-    // Checks wing_dead flag periodically; exits cleanly when cmd_wing
-    // confirms Wing is truly gone (not just a transient timeout).
+    // Live event loop. 60s read timeout wakes us periodically so we can:
+    //  1. Send a keepalive on event_wing itself - keeps NAT/firewall mapping
+    //     alive (routers commonly drop idle TCP after ~5 min of silence)
+    //  2. Check the wing_dead flag from cmd_wing's health monitor
+    // A timeout here is NORMAL (just means Wing has been quiet) - it is
+    // only treated as a real problem if the keepalive write itself fails.
     let mut consecutive_errors = 0u32;
     loop {
         if wing_dead.load(std::sync::atomic::Ordering::Relaxed) {
@@ -269,13 +272,31 @@ fn main() -> Result<(), libwing::Error> {
             }
             Ok(_) => { consecutive_errors = 0; }
             Err(e) => {
-                consecutive_errors += 1;
-                eprintln!("[wingmon] event_wing error #{}: {}", consecutive_errors, e);
-                if consecutive_errors > 10 {
-                    eprintln!("[wingmon] disconnecting");
+                let msg = e.to_string();
+                let is_timeout = msg.contains("10060") || msg.contains("timed out")
+                    || msg.contains("timeout") || msg.contains("WouldBlock");
+
+                if is_timeout {
+                    // Normal - Wing has just been quiet. Send a keepalive to
+                    // keep the connection warm through any NAT/firewall.
+                    if event_wing.keep_alive().is_err() {
+                        consecutive_errors += 1;
+                        eprintln!("[wingmon] event_wing keepalive failed #{}", consecutive_errors);
+                    } else {
+                        consecutive_errors = 0;
+                    }
+                } else {
+                    consecutive_errors += 1;
+                    eprintln!("[wingmon] event_wing error #{}: {}", consecutive_errors, e);
+                }
+
+                if consecutive_errors > 5 {
+                    eprintln!("[wingmon] event_wing unrecoverable - disconnecting");
                     return Err(e);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                if !is_timeout {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
             }
         }
     }
