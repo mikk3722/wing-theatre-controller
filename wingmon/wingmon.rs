@@ -277,11 +277,23 @@ fn main() -> Result<(), libwing::Error> {
                     || msg.contains("timeout") || msg.contains("WouldBlock");
 
                 if is_timeout {
-                    // Normal - Wing has just been quiet. Send a keepalive to
-                    // keep the connection warm through any NAT/firewall.
-                    if event_wing.keep_alive().is_err() {
+                    // Normal - Wing has just been quiet. Re-request a known
+                    // parameter (same mechanism used during SYNC) to generate
+                    // real Wing-protocol traffic and keep the connection warm
+                    // through NAT/firewall idle timeouts. Using keep_alive()
+                    // here confused Wing's protocol state on this connection
+                    // (it's meant for the command connection, not the event
+                    // subscription connection) - this caused GO and live
+                    // updates to silently stop working on Windows.
+                    let ping_id = WingConsole::name_to_id("/ch/1/mute");
+                    let ok = if let Some(id) = ping_id {
+                        event_wing.request_node_data(id).is_ok()
+                    } else {
+                        true // can't resolve path - don't treat as an error
+                    };
+                    if !ok {
                         consecutive_errors += 1;
-                        eprintln!("[wingmon] event_wing keepalive failed #{}", consecutive_errors);
+                        eprintln!("[wingmon] event_wing keepalive-ping failed #{}", consecutive_errors);
                     } else {
                         consecutive_errors = 0;
                     }
