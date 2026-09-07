@@ -24,6 +24,57 @@ fn print_node(tx: &mpsc::Sender<String>, prefix: &str, id: i32, val: &str) {
     }
 }
 
+/// Encode one parameter as Wing binary: d7 [4-byte hash] [compact value]
+/// Matches Wing Editor's wire format exactly.
+/// Hash bytes containing 0xdf are escaped with 0xde (Wing protocol requirement).
+fn encode_param(path: &str, val: &str) -> Option<Vec<u8>> {
+    let id = WingConsole::name_to_id(path)?;
+    let id_bytes = id.to_be_bytes();
+
+    // Escape 0xdf bytes in hash (Wing protocol)
+    let mut buf = vec![0xd7u8];
+    for b in id_bytes {
+        if b == 0xdf { buf.push(0xde); }
+        buf.push(b);
+    }
+
+    let val = val.trim();
+
+    // Try integer
+    if let Ok(i) = val.parse::<i32>() {
+        if i >= 0 && i <= 127 {
+            buf.push(i as u8);
+        } else {
+            let b = i.to_be_bytes();
+            buf.extend_from_slice(&[0xd4, b[0], b[1], b[2], b[3]]);
+        }
+        return Some(buf);
+    }
+
+    // Try float
+    if let Ok(f) = val.parse::<f32>() {
+        let b = f.to_be_bytes();
+        buf.extend_from_slice(&[0xd5, b[0], b[1], b[2], b[3]]);
+        return Some(buf);
+    }
+
+    // String
+    let bytes = val.as_bytes();
+    let len = bytes.len();
+    if len == 0 {
+        buf.push(0xd0);
+    } else if len <= 64 {
+        buf.push(0x7f + len as u8);
+    } else if len <= 256 {
+        buf.push(0xd1);
+        buf.push((len - 1) as u8);
+    } else {
+        return None; // too long
+    }
+    buf.extend_from_slice(bytes);
+    Some(buf)
+}
+
 fn main() -> Result<(), libwing::Error> {
     let mut args = Args::new("Usage: wingmon [-h host]\n   -h host : Wing IP");
     let mut host: Option<String> = None;
@@ -34,14 +85,11 @@ fn main() -> Result<(), libwing::Error> {
         }
     }
 
-    // stdout channel — single writer thread with explicit flush after each message
+    // stdout channel — single writer thread, explicit flush after every message
     let (tx_out, rx_out) = mpsc::channel::<String>();
     std::thread::spawn(move || {
         let mut out = std::io::BufWriter::new(std::io::stdout());
-        for msg in rx_out {
-            let _ = writeln!(out, "{}", msg);
-            let _ = out.flush();
-        }
+        for msg in rx_out { let _ = writeln!(out, "{}", msg); let _ = out.flush(); }
     });
 
     // Connection 1: event_wing — SYNC + live events
@@ -82,12 +130,10 @@ fn main() -> Result<(), libwing::Error> {
     tx_out.send(format!("SYNC_COMPLETE {}", total)).ok();
     eprintln!("[wingmon] SYNC done: {} params.", total);
 
-    // cmd channel: all commands go through here (from stdin thread + keepalive thread)
+    // cmd channel: stdin + internal keepalive both feed here
     let (tx_cmd, rx_cmd) = mpsc::channel::<String>();
 
-    // Stdin thread: forwards Python commands to cmd channel
-    // If stdin is EOF (PyInstaller windowed mode), thread exits silently —
-    // keepalive thread keeps the connection alive regardless
+    // Stdin thread — forwards Python commands to cmd channel
     let tx_stdin = tx_cmd.clone();
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
@@ -98,8 +144,7 @@ fn main() -> Result<(), libwing::Error> {
         eprintln!("[wingmon] stdin EOF — internal keepalive maintains connection");
     });
 
-    // Internal keepalive thread: sends KEEPALIVE every 4s
-    // Ensures Wing never drops cmd_wing even without Python stdin
+    // Internal keepalive thread — every 4s regardless of stdin state
     let tx_ka = tx_cmd.clone();
     std::thread::spawn(move || {
         loop {
@@ -108,7 +153,7 @@ fn main() -> Result<(), libwing::Error> {
         }
     });
 
-    // cmd_wing thread: single owner of WingConsole, no Send required
+    // cmd_wing thread — single owner of cmd WingConsole
     let host2 = host.clone();
     std::thread::spawn(move || {
         let mut cmd_opt: Option<WingConsole> = None;
@@ -129,25 +174,38 @@ fn main() -> Result<(), libwing::Error> {
             }
         }
 
-        // Process all commands from channel (stdin + internal keepalive)
+        // Process commands
         for l in rx_cmd {
             let trimmed = l.trim();
             let mut reconnect = false;
 
             if let Some(ref mut cmd) = cmd_opt {
+
                 if let Some(params) = trimmed.strip_prefix("BATCH_SET ") {
+                    // Build one binary buffer for ALL params — sent in a single TCP write
+                    // matching Wing Editor's wire format exactly.
+                    // Prefix: df d1 = channel 1 select (required by Wing protocol)
+                    let mut buf: Vec<u8> = vec![0xdf, 0xd1];
                     for param in params.split(',') {
                         if let Some((path, val)) = param.split_once('=') {
-                            if let Some(id) = WingConsole::name_to_id(path.trim()) {
-                                let t = val.trim();
-                                let r = if let Ok(i) = t.parse::<i32>()      { cmd.set_int(id, i) }
-                                        else if let Ok(f) = t.parse::<f32>() { cmd.set_float(id, f) }
-                                        else                                  { cmd.set_string(id, t) };
-                                if r.is_err() { reconnect = true; break; }
+                            if let Some(encoded) = encode_param(path.trim(), val) {
+                                buf.extend_from_slice(&encoded);
                             }
                         }
                     }
+                    if buf.len() > 2 {
+                        if let Err(e) = cmd.write_raw(&buf) {
+                            let msg = e.to_string();
+                            if msg.contains("10060") || msg.contains("timed out") || msg.contains("timeout") {
+                                eprintln!("[wingmon] Wing write timeout: {} — pausing 500ms", msg);
+                                std::thread::sleep(std::time::Duration::from_millis(500));
+                            }
+                            reconnect = true;
+                        }
+                    }
+
                 } else if let Some(rest) = trimmed.strip_prefix("SET ") {
+                    // Single SET — for fades and live updates
                     if let Some(space) = rest.find(' ') {
                         let path = &rest[..space];
                         let val  = rest[space+1..].trim();
@@ -161,9 +219,11 @@ fn main() -> Result<(), libwing::Error> {
                             }
                         }
                     }
+
                 } else if trimmed == "KEEPALIVE" {
                     if cmd.keep_alive().is_err() { reconnect = true; }
                 }
+
             } else {
                 reconnect = true;
             }
@@ -188,9 +248,7 @@ fn main() -> Result<(), libwing::Error> {
         }
     });
 
-    // Live event loop — main thread
-    // libwing may return periodic timeout errors (especially on Windows).
-    // We only disconnect after 10+ consecutive errors (= real disconnection).
+    // Live event loop — main thread, runs forever
     let mut consecutive_errors = 0u32;
     loop {
         match event_wing.read() {
@@ -198,9 +256,7 @@ fn main() -> Result<(), libwing::Error> {
                 consecutive_errors = 0;
                 print_node(&tx_out, "", id, &data.get_string());
             }
-            Ok(_) => {
-                consecutive_errors = 0;
-            }
+            Ok(_) => { consecutive_errors = 0; }
             Err(e) => {
                 consecutive_errors += 1;
                 eprintln!("[wingmon] event_wing error #{}: {}", consecutive_errors, e);
@@ -208,7 +264,6 @@ fn main() -> Result<(), libwing::Error> {
                     eprintln!("[wingmon] too many consecutive errors — disconnecting");
                     return Err(e);
                 }
-                // Brief pause before retry
                 std::thread::sleep(std::time::Duration::from_millis(300));
                 continue;
             }

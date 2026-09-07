@@ -20,11 +20,11 @@ jobs:
         run: |
           git clone https://github.com/dannyfiresnake/libwing.git
           cp wingmon/wingmon.rs libwing/tools/wingmon.rs
+          python3 wingmon/patch_libwing.py
           cd libwing
           cargo build --release --example wingmon
           cp target/release/examples/wingmon ../wingmon-macos
           codesign --sign - --force ../wingmon-macos
-
       - uses: actions/upload-artifact@v4
         with:
           name: wingmon-macos
@@ -42,10 +42,10 @@ jobs:
         run: |
           git clone https://github.com/dannyfiresnake/libwing.git
           Copy-Item wingmon/wingmon.rs libwing/tools/wingmon.rs
+          python3 wingmon/patch_libwing.py
           cd libwing
           cargo build --release --example wingmon
           Copy-Item target/release/examples/wingmon.exe ../wingmon.exe
-
       - uses: actions/upload-artifact@v4
         with:
           name: wingmon-windows
@@ -76,7 +76,7 @@ jobs:
           echo "${{ github.ref_name }} (build ${{ github.run_number }}, $(date +%Y-%m-%d))" > version.txt
           # Copy propmap from libwing
           git clone https://github.com/dannyfiresnake/libwing.git libwing_tmp
-          cp libwing_tmp/propmap.jsonl propmap.jsonl || echo "propmap not found, skipping"
+          cp libwing_tmp/src/propmap.jsonl propmap.jsonl || echo "propmap not found, skipping"
           rm -rf libwing_tmp
           pyinstaller \
             --name "Wing Theatre Controller" \
@@ -125,7 +125,7 @@ jobs:
           "${{ github.ref_name }} (build ${{ github.run_number }}, $(Get-Date -Format 'yyyy-MM-dd'))" | Out-File -FilePath version.txt -Encoding utf8
           # Copy propmap from libwing
           git clone https://github.com/dannyfiresnake/libwing.git libwing_tmp
-          Copy-Item libwing_tmp/propmap.jsonl propmap.jsonl -ErrorAction SilentlyContinue
+          Copy-Item libwing_tmp/src/propmap.jsonl propmap.jsonl -ErrorAction SilentlyContinue
           Remove-Item libwing_tmp -Recurse -Force
           pyinstaller `
             --name "Wing Theatre Controller" `
