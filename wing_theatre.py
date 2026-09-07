@@ -927,20 +927,33 @@ class WingOSC(QObject):
             self._wingmon_running = True
 
             # Try to ensure Wing traffic routes through the selected interface.
-            # On macOS, adding a host route fixes the issue when both WiFi and
-            # Ethernet are active. Silently ignored if route already exists.
+            # Prevents Wing traffic taking the wrong path when multiple
+            # interfaces are active (WiFi, Ethernet, VPN etc.).
             env = os.environ.copy()
-            if self.local_ip and self.local_ip != "0.0.0.0" and sys.platform != 'win32':
+            if self.local_ip and self.local_ip != "0.0.0.0":
                 try:
-                    iface_name = self._get_iface_name(self.local_ip)
-                    if iface_name:
+                    if sys.platform != 'win32':
+                        iface_name = self._get_iface_name(self.local_ip)
+                        if iface_name:
+                            subprocess.run(
+                                ['route', 'add', '-host', self.ip,
+                                 '-interface', iface_name],
+                                capture_output=True, timeout=3)
+                            env['BIND_ADDR'] = self.local_ip
+                            self.log_message.emit(
+                                f"Route set: {self.ip} -> {iface_name} ({self.local_ip})")
+                    else:
+                        # Windows: add a host route via the selected interface's
+                        # own IP as gateway — forces traffic to that interface
+                        # even when other interfaces (VPN, second NIC etc.) exist.
                         subprocess.run(
-                            ['route', 'add', '-host', self.ip,
-                             '-interface', iface_name],
-                            capture_output=True, timeout=3)
+                            ['route', 'add', self.ip, 'mask', '255.255.255.255',
+                             self.local_ip, 'metric', '1'],
+                            capture_output=True, timeout=3,
+                            creationflags=subprocess.CREATE_NO_WINDOW)
                         env['BIND_ADDR'] = self.local_ip
                         self.log_message.emit(
-                            f"Route set: {self.ip} -> {iface_name} ({self.local_ip})")
+                            f"Route set: {self.ip} -> via {self.local_ip}")
                 except Exception:
                     pass
 
@@ -1358,10 +1371,6 @@ class WingOSC(QObject):
         params = []     # (dot_path_str, is_priority)
         delayed_cmds = []
         faded_paths = set()
-
-        def to_dot(path):
-            # /ch/1/mute  ->  /ch.1.mute
-            return '/' + '.'.join(path.split('/')[1:])
 
         for path, value in snapshot.data.items():
             if not self._path_in_scope(path, snapshot):
