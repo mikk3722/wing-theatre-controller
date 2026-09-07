@@ -1,17 +1,17 @@
 """
-Inject write_raw() into libwing's WingConsole so wingmon can send
-all BATCH_SET parameters in ONE TCP write — matching Wing Editor's
-wire protocol exactly.
+Inject write_raw() into libwing's WingConsole impl block.
+Inserts before the FIRST closing brace that ends the main impl block.
 """
 import re, sys
 
 path = 'libwing/src/console.rs'
 src = open(path).read()
 
+if 'write_raw' in src:
+    print('write_raw already present — skipping')
+    sys.exit(0)
+
 method = '''
-    /// Send raw bytes directly to Wing's TCP socket.
-    /// Used by BATCH_SET to send all parameters in a single write,
-    /// matching Wing Editor's binary protocol.
     pub fn write_raw(&mut self, data: &[u8]) -> crate::Result<()> {
         use std::io::Write;
         self.wsock.clone().lock().unwrap().write_all(data)?;
@@ -19,17 +19,37 @@ method = '''
     }
 '''
 
-# Insert before the last closing brace in the file
-if 'write_raw' in src:
-    print('write_raw already present — skipping')
-    sys.exit(0)
-
-# Find last } and insert method before it
-last_brace = src.rfind('\n}')
-if last_brace < 0:
-    print('ERROR: could not find closing brace in console.rs')
+# Find "impl WingConsole" block and insert before its closing brace.
+# Strategy: find "impl WingConsole {", then find the matching closing brace.
+impl_start = src.find('impl WingConsole')
+if impl_start < 0:
+    print('ERROR: impl WingConsole not found in console.rs')
+    print('Contents:', src[:500])
     sys.exit(1)
 
-patched = src[:last_brace] + method + src[last_brace:]
+# Find the opening brace of the impl block
+brace_open = src.find('{', impl_start)
+if brace_open < 0:
+    print('ERROR: no opening brace after impl WingConsole')
+    sys.exit(1)
+
+# Walk forward to find the matching closing brace
+depth = 0
+pos = brace_open
+while pos < len(src):
+    if src[pos] == '{':
+        depth += 1
+    elif src[pos] == '}':
+        depth -= 1
+        if depth == 0:
+            # This is the closing brace of impl WingConsole
+            insert_at = pos
+            break
+    pos += 1
+else:
+    print('ERROR: could not find closing brace of impl WingConsole')
+    sys.exit(1)
+
+patched = src[:insert_at] + method + src[insert_at:]
 open(path, 'w').write(patched)
-print(f'write_raw injected into {path}')
+print(f'write_raw injected into impl WingConsole at position {insert_at}')
