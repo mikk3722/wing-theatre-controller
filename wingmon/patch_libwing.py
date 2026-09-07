@@ -1,7 +1,7 @@
 """
 Patch libwing's WingConsole with:
-1. write_raw()        - single TCP write for BATCH_SET (Wing Editor protocol)
-2. set_read_timeout() - override libwing's short default timeout
+1. write_raw()    - single TCP write for BATCH_SET (Wing Editor protocol)
+2. set_nodelay()  - disable Nagle's algorithm for fast small writes
 """
 import re, sys
 
@@ -20,17 +20,14 @@ methods = '''
         Ok(())
     }
 
-    /// Override the read timeout on the underlying socket.
-    /// Pass a large value (e.g. 86400) to effectively disable timeouts,
-    /// preventing spurious OS 10060 errors on Windows.
-    pub fn set_read_timeout_secs(&self, secs: u64) {
-        use std::time::Duration;
-        let dur = if secs == 0 { None } else { Some(Duration::from_secs(secs)) };
-        let _ = self.wsock.clone().lock().unwrap().set_read_timeout(dur);
+    /// Disable Nagle's algorithm (TCP_NODELAY) so small writes are sent
+    /// immediately instead of being buffered waiting for more data or an ACK.
+    /// Critical for fast BATCH_SET bursts of many small writes.
+    pub fn set_nodelay(&self) {
+        let _ = self.wsock.clone().lock().unwrap().set_nodelay(true);
     }
 '''
 
-# Insert before closing brace of impl WingConsole
 impl_start = src.find('impl WingConsole')
 if impl_start < 0:
     print('ERROR: impl WingConsole not found'); sys.exit(1)
@@ -45,4 +42,4 @@ while pos < len(src):
     pos += 1
 
 open(path, 'w', encoding='utf-8').write(src[:insert_at] + methods + src[insert_at:])
-print('write_raw + set_read_timeout_secs injected into impl WingConsole')
+print('write_raw + set_nodelay injected into impl WingConsole')

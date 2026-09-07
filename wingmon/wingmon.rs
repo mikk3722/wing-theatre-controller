@@ -94,6 +94,7 @@ fn main() -> Result<(), libwing::Error> {
 
     // Connection 1: event_wing - SYNC + live events
     let mut event_wing = WingConsole::connect(host.as_deref())?;
+    event_wing.set_nodelay();
     // Override libwing's short read timeout - prevents spurious OS 10060 on Windows.
     // Real disconnections are detected via cmd_wing keepalive failures instead.
     event_wing.set_read_timeout_secs(60); // periodic wake-up so we can send keepalive
@@ -176,6 +177,7 @@ fn main() -> Result<(), libwing::Error> {
             match WingConsole::connect(host2.as_deref()) {
                 Ok(mut c) => {
                     eprintln!("[wingmon] cmd_wing connected");
+                    c.set_nodelay();
                     c.keep_alive().ok();
                     cmd_opt = Some(c);
                     break;
@@ -193,28 +195,50 @@ fn main() -> Result<(), libwing::Error> {
 
             if let Some(ref mut cmd) = cmd_opt {
                 if let Some(params) = trimmed.strip_prefix("BATCH_SET ") {
-                    let mut buf: Vec<u8> = vec![0xdf, 0xd1];
-                    for param in params.split(',') {
-                        if let Some((path, val)) = param.split_once('=') {
-                            if let Some(encoded) = encode_param(path.trim(), val) {
-                                buf.extend_from_slice(&encoded);
+                    // Small bursts (matching Wing Editor's wire behaviour),
+                    // sent back-to-back with no artificial delay. TCP_NODELAY
+                    // is enabled on this connection so each write goes out
+                    // immediately rather than waiting on Nagle's algorithm.
+                    const CHUNK: usize = 4;
+                    let all_params: Vec<&str> = params.split(',').collect();
+                    let mut sent_bytes = 0usize;
+                    let mut chunk_count = 0usize;
+                    let mut had_error = false;
+                    let t0 = std::time::Instant::now();
+
+                    for group in all_params.chunks(CHUNK) {
+                        let mut buf: Vec<u8> = vec![0xdf, 0xd1];
+                        for param in group {
+                            if let Some((path, val)) = param.split_once('=') {
+                                if let Some(encoded) = encode_param(path.trim(), val) {
+                                    buf.extend_from_slice(&encoded);
+                                }
+                            }
+                        }
+                        if buf.len() > 2 {
+                            match cmd.write_raw(&buf) {
+                                Ok(_) => {
+                                    sent_bytes += buf.len();
+                                    chunk_count += 1;
+                                }
+                                Err(e) => {
+                                    let s = e.to_string();
+                                    eprintln!("[wingmon] BATCH_SET chunk {} FAILED: {}", chunk_count, s);
+                                    if s.contains("10060") || s.contains("timed out") {
+                                        std::thread::sleep(std::time::Duration::from_millis(500));
+                                    }
+                                    had_error = true;
+                                    break;
+                                }
                             }
                         }
                     }
-                    if buf.len() > 2 {
-                        match cmd.write_raw(&buf) {
-                            Ok(_) => {
-                                eprintln!("[wingmon] BATCH_SET sent: {} bytes", buf.len());
-                            }
-                            Err(e) => {
-                                let s = e.to_string();
-                                eprintln!("[wingmon] BATCH_SET write FAILED: {}", s);
-                                if s.contains("10060") || s.contains("timed out") {
-                                    std::thread::sleep(std::time::Duration::from_millis(500));
-                                }
-                                reconnect = true;
-                            }
-                        }
+
+                    if had_error {
+                        reconnect = true;
+                    } else {
+                        eprintln!("[wingmon] BATCH_SET sent: {} bytes in {} bursts, {}ms",
+                            sent_bytes, chunk_count, t0.elapsed().as_millis());
                     }
                 } else if let Some(rest) = trimmed.strip_prefix("SET ") {
                     if let Some(space) = rest.find(' ') {
@@ -239,9 +263,11 @@ fn main() -> Result<(), libwing::Error> {
                 let mut ok = false;
                 for _ in 0..3 {
                     if let Ok(mut c) = WingConsole::connect(host2.as_deref()) {
+                        c.set_nodelay();
                         c.keep_alive().ok();
                         cmd_opt = Some(c);
                         dead_count = 0;
+                        c.set_nodelay();
                         eprintln!("[wingmon] cmd_wing reconnected");
                         ok = true;
                         break;
