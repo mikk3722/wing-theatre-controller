@@ -85,18 +85,18 @@ fn main() -> Result<(), libwing::Error> {
         }
     }
 
-    // stdout channel — single writer thread, explicit flush after every message
+    // stdout channel - single writer thread, explicit flush after every message
     let (tx_out, rx_out) = mpsc::channel::<String>();
     std::thread::spawn(move || {
         let mut out = std::io::BufWriter::new(std::io::stdout());
         for msg in rx_out { let _ = writeln!(out, "{}", msg); let _ = out.flush(); }
     });
 
-    // Connection 1: event_wing — SYNC + live events
+    // Connection 1: event_wing - SYNC + live events
     let mut event_wing = WingConsole::connect(host.as_deref())?;
-    // Override libwing's short read timeout — prevents spurious OS 10060 on Windows.
+    // Override libwing's short read timeout - prevents spurious OS 10060 on Windows.
     // Real disconnections are detected via cmd_wing keepalive failures instead.
-    event_wing.set_read_timeout_secs(86400); // 24h ≈ blocking
+    event_wing.set_read_timeout_secs(86400); // 24h ~ blocking
     eprintln!("[wingmon] Connected!");
     tx_out.send("Connected!".to_string()).ok();
 
@@ -140,7 +140,7 @@ fn main() -> Result<(), libwing::Error> {
     // cmd channel: stdin + internal keepalive both feed here
     let (tx_cmd, rx_cmd) = mpsc::channel::<String>();
 
-    // Stdin thread — forwards Python commands to cmd channel
+    // Stdin thread - forwards Python commands to cmd channel
     let tx_stdin = tx_cmd.clone();
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
@@ -148,10 +148,10 @@ fn main() -> Result<(), libwing::Error> {
             let Ok(l) = line else { break };
             tx_stdin.send(l).ok();
         }
-        eprintln!("[wingmon] stdin EOF — internal keepalive maintains connection");
+        eprintln!("[wingmon] stdin EOF - internal keepalive maintains connection");
     });
 
-    // Internal keepalive thread — every 4s regardless of stdin state
+    // Internal keepalive thread - every 4s regardless of stdin state
     let tx_ka = tx_cmd.clone();
     std::thread::spawn(move || {
         loop {
@@ -160,7 +160,7 @@ fn main() -> Result<(), libwing::Error> {
         }
     });
 
-    // cmd_wing thread — single owner of cmd WingConsole
+    // cmd_wing thread - single owner of cmd WingConsole
     // Also health monitor: repeated keepalive failures = Wing is gone → DEAD signal
     let host2 = host.clone();
     std::thread::spawn(move || {
@@ -240,9 +240,9 @@ fn main() -> Result<(), libwing::Error> {
                 if !ok {
                     dead_count += 1;
                     eprintln!("[wingmon] cmd_wing reconnect failed ({})", dead_count);
-                    // 5 failed reconnects ≈ 7.5s → Wing is truly gone
+                    // 5 failed reconnects ~ 7.5s → Wing is truly gone
                     if dead_count >= 5 {
-                        eprintln!("[wingmon] Wing appears dead — signalling disconnect");
+                        eprintln!("[wingmon] Wing appears dead - signalling disconnect");
                         wing_dead_cmd.store(true, std::sync::atomic::Ordering::Relaxed);
                         return;
                     }
@@ -252,13 +252,13 @@ fn main() -> Result<(), libwing::Error> {
     });
 
 
-    // Live event loop — blocks on read() until Wing sends data.
+    // Live event loop - blocks on read() until Wing sends data.
     // Checks wing_dead flag periodically; exits cleanly when cmd_wing
     // confirms Wing is truly gone (not just a transient timeout).
     let mut consecutive_errors = 0u32;
     loop {
         if wing_dead.load(std::sync::atomic::Ordering::Relaxed) {
-            eprintln!("[wingmon] Wing confirmed dead — disconnecting");
+            eprintln!("[wingmon] Wing confirmed dead - disconnecting");
             return Err(libwing::Error::from(std::io::Error::new(
                 std::io::ErrorKind::ConnectionReset, "Wing connection lost")));
         }
