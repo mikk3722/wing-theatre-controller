@@ -840,21 +840,30 @@ class WingOSC(QObject):
     def _load_dynamic_propmap(self):
         """
         Load propmap.jsonl to resolve anonymous propN events from wingmon.
-        Returns {(section, model, index): param_name} for:
-          - Per-channel: eq, gate, dyn, flt  (/ch/1/eq/STD/lg etc.)
-          - FX slots:    fx                  (/fx/1/HALL/pdel etc.)
+        Returns ({(section, model, index): param_name}, float_paths_set).
+        float_paths_set contains all fullnames with type 'linear float' or
+        'log float' — used to ensure EQ gain=0 recalls as set_float(0.0),
+        not set_int(0) which Wing interprets as step 0 (minimum value).
         """
         import json
         lookup = {}
+        float_paths = set()
         CHANNEL_SECTIONS = {"eq", "gate", "dyn", "flt"}
+        FLOAT_TYPES = {"linear float", "log float"}
         try:
             with open(self.PROPMAP_PATH) as f:
                 for line in f:
                     try:
                         e = json.loads(line.strip())
-                        fn  = e.get("fullname", "")
-                        idx = e.get("index", 0)
-                        if idx <= 0 or not fn:
+                        fn   = e.get("fullname", "")
+                        pidx = e.get("index", 0)
+                        tp   = e.get("type", "")
+                        if not fn:
+                            continue
+                        # Track float-type paths (no $ = not read-only)
+                        if tp in FLOAT_TYPES and "$" not in fn:
+                            float_paths.add(fn)
+                        if pidx <= 0:
                             continue
                         parts = fn.split("/")
                         if len(parts) < 5:
@@ -863,21 +872,22 @@ class WingOSC(QObject):
                         if parts[1] in ("ch","bus","mtx","main","dca") and parts[3] in CHANNEL_SECTIONS:
                             sec, mdl, param = parts[3], parts[4], "/".join(parts[5:])
                             if mdl and param:
-                                lookup.setdefault((sec, mdl, idx), param)
+                                lookup.setdefault((sec, mdl, pidx), param)
                         # FX slots: /fx/N/MODEL/param
                         elif parts[1] == "fx" and len(parts) >= 5:
                             mdl, param = parts[3], "/".join(parts[4:])
                             if mdl and param:
-                                lookup.setdefault(("fx", mdl, idx), param)
+                                lookup.setdefault(("fx", mdl, pidx), param)
                     except Exception:
                         pass
             self.log_message.emit(
                 f"Dynamic propmap: {len(lookup)} entries "
-                f"(EQ/Gate/Dyn/Filter/FX)")
+                f"(EQ/Gate/Dyn/Filter/FX), {len(float_paths)} float-type params")
         except FileNotFoundError:
+            float_paths = set()
             self.log_message.emit(
                 "propmap.jsonl not found -- wingmon props won't be fully resolved")
-        return lookup
+        return lookup, float_paths
 
     # ── Connection ────────────────────────────────────────────────────────────
 
@@ -912,7 +922,7 @@ class WingOSC(QObject):
             return
         import subprocess, threading
         try:
-            self._prop_lookup   = self._load_dynamic_propmap()
+            self._prop_lookup, self._float_paths = self._load_dynamic_propmap()
             self._dyn_models    = {}
             self._wingmon_running = True
 
@@ -996,6 +1006,33 @@ class WingOSC(QObject):
             pass
         return None
 
+    def _parse_wing_val(self, path: str, val_str: str):
+        """Parse a Wing parameter value.
+
+        Uses propmap type info so that float params (EQ gain, dyn threshold etc.)
+        are always stored as float even when Wing sends whole-number values like 0 or 1.
+        Without this, set_int(0) for EQ gain would set step 0 (≈ -12 dB) not 0 dB.
+        """
+        val_str = val_str.strip()
+        if '.' in val_str:
+            try: return float(val_str)
+            except: return val_str
+        try:
+            iv = int(val_str)
+            # Values outside [0,1] are unambiguously float for float params
+            if not (0 <= iv <= 1):
+                return float(iv)
+            # For 0 and 1: check propmap type.
+            # If this path is a known float-type param, store as float
+            # so wingmon uses set_float (actual value) not set_int (step number).
+            float_paths = getattr(self, '_float_paths', set())
+            if path in float_paths:
+                return float(iv)
+            return iv   # boolean param (on/off, mute, inv etc.)
+        except ValueError:
+            return val_str
+
+
     def _wingmon_loop(self):
         """
         Read wingmon stdout. Handles:
@@ -1055,7 +1092,7 @@ class WingOSC(QObject):
                                     path = f"{ch_path}/{section}/{model}/{param}"
                                 path = path
                                 try:
-                                    value = (float(val_str) if '.' in val_str else (lambda iv: iv if 0 <= iv <= 1 else float(iv))(int(val_str)))
+                                    value = self._parse_wing_val(path, val_str)
                                 except ValueError:
                                     value = val_str
                                 if self._capturing:
@@ -1086,7 +1123,7 @@ class WingOSC(QObject):
                             current_ctx[parts[3]] = (ch_path, model)
 
                     try:
-                        value = (float(val_str) if '.' in val_str else (lambda iv: iv if 0 <= iv <= 1 else float(iv))(int(val_str)))
+                        value = self._parse_wing_val(path, val_str)
                     except ValueError:
                         value = val_str
 
@@ -1111,7 +1148,7 @@ class WingOSC(QObject):
                             else:
                                 path = f"{ch_path}/{section}/{model}/{param}"
                             try:
-                                value = (float(val_str) if '.' in val_str else (lambda iv: iv if 0 <= iv <= 1 else float(iv))(int(val_str)))
+                                value = self._parse_wing_val(path, val_str)
                             except ValueError:
                                 value = val_str
                             self._emit_wing_event(path, value)
@@ -1155,9 +1192,12 @@ class WingOSC(QObject):
                             value = float(val_str)
                         else:
                             iv = int(val_str)
-                            # Small non-negative ints (mute, col etc.) stay int
-                            # Negative or large values are float parameters
+                            # Use propmap type info: float params at 0 or 1
+                            # must be set_float not set_int (step number)
                             value = iv if 0 <= iv <= 1 else float(iv)
+                            float_paths = getattr(self, '_float_paths', set())
+                            if isinstance(value, int) and path in float_paths:
+                                value = float(value)
                     except ValueError:
                         value = val_str
                     self._emit_wing_event(path, value)
@@ -1423,8 +1463,9 @@ class WingOSC(QObject):
                 try: value = float(value)
                 except ValueError: pass
         # Only convert non-negative whole floats to int (color, icon, on/off)
-        # Keep negative/large floats (faders, EQ) as float -> set_float in wingmon
-        if isinstance(value, float) and value == int(value) and 0 <= value <= 1:
+        # Only convert to int if this is truly a boolean param (not a float param at 0 or 1)
+        float_paths = getattr(self, '_float_paths', set())
+        if isinstance(value, float) and value == int(value) and 0 <= value <= 1 and path not in float_paths:
             value = int(value)
         self._wing_state[path] = value
         if isinstance(value, float):
