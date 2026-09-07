@@ -1397,7 +1397,9 @@ class WingOSC(QObject):
                         try: v = float(v)
                         except ValueError: pass
                 if isinstance(v, float) and v == int(v) and 0 <= v <= 1:
-                    v = int(v)
+                    _fp = getattr(self, '_float_paths', set())
+                    if path not in _fp:
+                        v = int(v)
                 self._wing_state[path] = v
                 if isinstance(v, float):
                     vstr = f"{v:.6g}"
