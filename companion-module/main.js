@@ -16,6 +16,7 @@ class WingTheatreInstance extends InstanceBase {
       next_cue_num: '',    next_cue_name: '',
       autoupdate: 'false', wing_connected: 'false',
       cue_count: '0',      fading: 'false',
+      selected_cue_num: '', selected_cue_name: '',
     }
     this._reconnect_timer = null
   }
@@ -111,6 +112,8 @@ class WingTheatreInstance extends InstanceBase {
       au_on:     { name: 'Auto Update ON',            options: [], callback: () => this._send('AU_ON') },
       au_off:    { name: 'Auto Update OFF',           options: [], callback: () => this._send('AU_OFF') },
       au_toggle: { name: 'Auto Update Toggle',        options: [], callback: () => this._send('AU_TOGGLE') },
+      next_cue:  { name: 'Next — move selection down (no GO)', options: [], callback: () => this._send('NEXT') },
+      prev_cue:  { name: 'Previous — move selection up (no GO)', options: [], callback: () => this._send('PREV') },
       get_state: { name: 'Request full state update', options: [], callback: () => this._send('GET_STATE') },
       snap_go: {
         name: 'GO specific cue',
@@ -155,6 +158,8 @@ class WingTheatreInstance extends InstanceBase {
       { variableId: 'wing_connected',   name: 'Wing connected (true/false)' },
       { variableId: 'cue_count',        name: 'Total cues' },
       { variableId: 'fading',           name: 'Fade in progress (true/false)' },
+      { variableId: 'selected_cue_num',  name: 'Selected cue number (cursor)' },
+      { variableId: 'selected_cue_name', name: 'Selected cue name (cursor)' },
     ])
     this.setVariableValues(this._state)
   }
@@ -178,6 +183,12 @@ class WingTheatreInstance extends InstanceBase {
         style:{text:'AUTO\nUPDATE', size:'14', color:WHITE, bgcolor:DARK},
         steps:[{down:[{actionId:'au_toggle',options:{}}],up:[]}],
         feedbacks:[{feedbackId:'autoupdate',options:{},style:{bgcolor:GREEN,color:BLACK}}] },
+      { type:'button', category:'Wing Theatre', name:'Next cue (no GO)',
+        style:{text:'NEXT\n$(wingtheatre:selected_cue_name)', size:'14', color:WHITE, bgcolor:DARK},
+        steps:[{down:[{actionId:'next_cue',options:{}}],up:[]}], feedbacks:[] },
+      { type:'button', category:'Wing Theatre', name:'Previous cue (no GO)',
+        style:{text:'PREV', size:'14', color:WHITE, bgcolor:DARK},
+        steps:[{down:[{actionId:'prev_cue',options:{}}],up:[]}], feedbacks:[] },
       { type:'button', category:'Wing Theatre', name:'Wing connected indicator',
         style:{text:'WING\nCONNECTED', size:'12', color:WHITE, bgcolor:combineRgb(100,30,30)},
         steps:[{down:[],up:[]}],

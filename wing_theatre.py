@@ -974,12 +974,9 @@ class WingOSC(QObject):
                 target=self._wingmon_loop, daemon=True, name="WingMon"
             ).start()
             self.log_message.emit("wingmon running -- real-time Wing state tracking active")
-            # Keepalive: Wing TCP times out after 10s. Send KEEPALIVE every 5s.
-            self._keepalive_timer = QTimer(self)
-            self._keepalive_timer.setInterval(2000)
-            self._keepalive_timer.timeout.connect(
-                lambda: self._wingmon_stdin("KEEPALIVE"))
-            self._keepalive_timer.start()
+            # Keepalive is handled inside wingmon itself (every 4s, independent
+            # of stdin). A Python-side timer would only duplicate that traffic
+            # and stops working when stdin is EOF, as in a PyInstaller build.
         except Exception as e:
             self.log_message.emit(f"wingmon error: {e}")
 
@@ -4963,49 +4960,44 @@ class MainWindow(QMainWindow):
             self.osc_settings_panel.tcp_set_running(True)
             self.status_bar.showMessage(f"TCP remote: listening on port {port}", 3000)
 
-    def _tcp_send_full_state(self):
-        """Send all current state to TCP client."""
-        snaps = self.show_file.snapshots
-        idx   = self.active_cue_index
-        count = len(snaps)
+    def _tcp_cue_state(self) -> dict:
+        """Build the cue-state dict sent to Companion.
 
-        cur_num  = f"{snaps[idx].number:03d}" if 0 <= idx < count else ""
-        cur_name = snaps[idx].name            if 0 <= idx < count else ""
-        nxt_idx  = idx + 1
-        nxt_num  = f"{snaps[nxt_idx].number:03d}" if 0 <= nxt_idx < count else ""
-        nxt_name = snaps[nxt_idx].name            if 0 <= nxt_idx < count else ""
-
-        self.tcp_server.send_full_state({
-            "current_cue_num":  cur_num,
-            "current_cue_name": cur_name,
-            "next_cue_num":     nxt_num,
-            "next_cue_name":    nxt_name,
-            "autoupdate":       str(self.osc._auto_update).lower(),
-            "wing_connected":   str(self.osc.is_connected).lower(),
-            "cue_count":        str(count),
-            "fading":           str(bool(self.osc._fade_jobs)).lower(),
-        })
-
-    def _tcp_send_cue_state(self):
-        """Send current/next/selected cue state."""
+        current  = the cue that was last fired (active_cue_index)
+        next     = the cue that the next GO will fire (the cursor position)
+        selected = the cursor position (same as next; named for clarity)
+        """
         snaps  = self.show_file.snapshots
+        count  = len(snaps)
         active = self.active_cue_index
         sel    = self.cue_panel.current_index
-        count  = len(snaps)
-        cur_num  = f"{snaps[active].number:03d}" if 0 <= active < count else ""
-        cur_name = snaps[active].name            if 0 <= active < count else ""
-        nxt_idx  = sel + 1  # next = one after selection
-        nxt_num  = f"{snaps[nxt_idx].number:03d}" if 0 <= nxt_idx < count else ""
-        nxt_name = snaps[nxt_idx].name            if 0 <= nxt_idx < count else ""
-        sel_num  = f"{snaps[sel].number:03d}" if 0 <= sel < count else ""
-        sel_name = snaps[sel].name            if 0 <= sel < count else ""
-        self.tcp_server.send_state("current_cue_num",  cur_num)
-        self.tcp_server.send_state("current_cue_name", cur_name)
-        self.tcp_server.send_state("next_cue_num",     nxt_num)
-        self.tcp_server.send_state("next_cue_name",    nxt_name)
-        self.tcp_server.send_state("selected_cue_num", sel_num)
-        self.tcp_server.send_state("selected_cue_name",sel_name)
-        self.tcp_server.send_state("cue_count",        str(count))
+
+        def num(i):  return f"{snaps[i].number:03d}" if 0 <= i < count else ""
+        def name(i): return snaps[i].name            if 0 <= i < count else ""
+
+        return {
+            "current_cue_num":   num(active),
+            "current_cue_name":  name(active),
+            "next_cue_num":      num(sel),
+            "next_cue_name":     name(sel),
+            "selected_cue_num":  num(sel),
+            "selected_cue_name": name(sel),
+            "cue_count":         str(count),
+        }
+
+    def _tcp_send_cue_state(self):
+        """Send cue-related state (after GO, NEXT, PREV)."""
+        self.tcp_server.send_full_state(self._tcp_cue_state())
+
+    def _tcp_send_full_state(self):
+        """Send all state — cue state plus connection/mode flags."""
+        state = self._tcp_cue_state()
+        state.update({
+            "autoupdate":     str(self.osc._auto_update).lower(),
+            "wing_connected": str(self.osc.is_connected).lower(),
+            "fading":         str(bool(self.osc._fade_jobs)).lower(),
+        })
+        self.tcp_server.send_full_state(state)
 
     def _on_tcp_command(self, cmd: str):
         """Handle command from TCP Companion client."""
@@ -5022,45 +5014,44 @@ class MainWindow(QMainWindow):
             return
 
         cmd_raw = cmd.strip()
-        cmd = cmd_raw.upper()
         self.status_bar.showMessage(f"TCP: received '{cmd_raw}'", 2000)
 
-        if cmd == "GO":
+        # Split into verb + argument. Only the verb is case-normalised —
+        # the argument keeps the user's original casing (cue names).
+        parts = cmd_raw.split(" ", 1)
+        verb  = parts[0].upper()
+        arg   = parts[1].strip() if len(parts) > 1 else ""
+
+        if verb == "GO":
             self._go()
-        elif cmd == "NEXT_GO":
+        elif verb == "NEXT_GO":
             self._osc_next_go()
-        elif cmd == "PREV_GO":
+        elif verb == "PREV_GO":
             self._osc_prev_go()
-        elif cmd.startswith("SNAP_GO "):
-            arg = cmd[8:].strip()
+        elif verb == "SNAP_GO":
             try:
-                n = int(arg)
-                self._osc_snap_go(n)
+                self._osc_snap_go(int(arg))
             except ValueError:
-                # Find by name
                 for i, s in enumerate(self.show_file.snapshots):
                     if s.name.lower() == arg.lower():
                         self.cue_panel.set_current(i)
-                        self._go(); break
-        elif cmd == "AU_ON":
+                        self._go()
+                        break
+        elif verb == "AU_ON":
             self._osc_autoupdate(True)
-        elif cmd == "AU_OFF":
+        elif verb == "AU_OFF":
             self._osc_autoupdate(False)
-        elif cmd == "AU_TOGGLE":
+        elif verb == "AU_TOGGLE":
             self._osc_autoupdate(not self.osc._auto_update)
-        elif cmd.startswith("ADD_SNAP"):
-            name = cmd[8:].strip().title() or None
-            if name:
-                self._osc_addsnap(name)
-            else:
-                self._osc_addsnap("")
-        elif cmd == "NEXT":
+        elif verb == "ADD_SNAP":
+            self._osc_addsnap(arg)          # arg keeps original casing
+        elif verb == "NEXT":
             self.cue_panel.go_next()
             self._tcp_send_cue_state()
-        elif cmd == "PREV":
+        elif verb == "PREV":
             self.cue_panel.go_prev()
             self._tcp_send_cue_state()
-        elif cmd == "GET_STATE":
+        elif verb == "GET_STATE":
             self._tcp_send_full_state()
 
     # ── OSC remote control handlers ──────────────────────────────────────────
