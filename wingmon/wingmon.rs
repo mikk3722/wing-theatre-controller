@@ -94,6 +94,9 @@ fn main() -> Result<(), libwing::Error> {
 
     // Connection 1: event_wing — SYNC + live events
     let mut event_wing = WingConsole::connect(host.as_deref())?;
+    // Disable libwing's short read timeout (causes spurious OS 10060 on Windows).
+    // Instead we rely on TCP keepalives to detect real disconnections quickly.
+    event_wing.set_read_timeout(86400).ok(); // 24h ≈ blocking read
     eprintln!("[wingmon] Connected!");
     tx_out.send("Connected!".to_string()).ok();
 
@@ -130,6 +133,10 @@ fn main() -> Result<(), libwing::Error> {
     tx_out.send(format!("SYNC_COMPLETE {}", total)).ok();
     eprintln!("[wingmon] SYNC done: {} params.", total);
 
+    // Shared flag: set by cmd_wing when Wing is truly dead
+    let wing_dead = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let wing_dead_cmd = std::sync::Arc::clone(&wing_dead);
+
     // cmd channel: stdin + internal keepalive both feed here
     let (tx_cmd, rx_cmd) = mpsc::channel::<String>();
 
@@ -154,11 +161,12 @@ fn main() -> Result<(), libwing::Error> {
     });
 
     // cmd_wing thread — single owner of cmd WingConsole
+    // Also health monitor: repeated keepalive failures = Wing is gone → DEAD signal
     let host2 = host.clone();
     std::thread::spawn(move || {
         let mut cmd_opt: Option<WingConsole> = None;
+        let mut dead_count = 0u32;
 
-        // Initial connect with retry
         loop {
             match WingConsole::connect(host2.as_deref()) {
                 Ok(mut c) => {
@@ -174,17 +182,12 @@ fn main() -> Result<(), libwing::Error> {
             }
         }
 
-        // Process commands
         for l in rx_cmd {
             let trimmed = l.trim();
             let mut reconnect = false;
 
             if let Some(ref mut cmd) = cmd_opt {
-
                 if let Some(params) = trimmed.strip_prefix("BATCH_SET ") {
-                    // Build one binary buffer for ALL params — sent in a single TCP write
-                    // matching Wing Editor's wire format exactly.
-                    // Prefix: df d1 = channel 1 select (required by Wing protocol)
                     let mut buf: Vec<u8> = vec![0xdf, 0xd1];
                     for param in params.split(',') {
                         if let Some((path, val)) = param.split_once('=') {
@@ -195,17 +198,14 @@ fn main() -> Result<(), libwing::Error> {
                     }
                     if buf.len() > 2 {
                         if let Err(e) = cmd.write_raw(&buf) {
-                            let msg = e.to_string();
-                            if msg.contains("10060") || msg.contains("timed out") || msg.contains("timeout") {
-                                eprintln!("[wingmon] Wing write timeout: {} — pausing 500ms", msg);
+                            let s = e.to_string();
+                            if s.contains("10060") || s.contains("timed out") {
                                 std::thread::sleep(std::time::Duration::from_millis(500));
                             }
                             reconnect = true;
                         }
                     }
-
                 } else if let Some(rest) = trimmed.strip_prefix("SET ") {
-                    // Single SET — for fades and live updates
                     if let Some(space) = rest.find(' ') {
                         let path = &rest[..space];
                         let val  = rest[space+1..].trim();
@@ -213,44 +213,55 @@ fn main() -> Result<(), libwing::Error> {
                             let r = if let Ok(i) = val.parse::<i32>()      { cmd.set_int(id, i) }
                                     else if let Ok(f) = val.parse::<f32>() { cmd.set_float(id, f) }
                                     else                                    { cmd.set_string(id, val) };
-                            if r.is_err() {
-                                eprintln!("[wingmon] SET error — reconnecting");
-                                reconnect = true;
-                            }
+                            if r.is_err() { reconnect = true; }
                         }
                     }
-
                 } else if trimmed == "KEEPALIVE" {
                     if cmd.keep_alive().is_err() { reconnect = true; }
                 }
-
             } else {
                 reconnect = true;
             }
 
             if reconnect {
-                eprintln!("[wingmon] cmd_wing reconnecting...");
                 cmd_opt = None;
-                loop {
-                    match WingConsole::connect(host2.as_deref()) {
-                        Ok(mut c) => {
-                            c.keep_alive().ok();
-                            cmd_opt = Some(c);
-                            eprintln!("[wingmon] cmd_wing reconnected");
-                            break;
-                        }
-                        Err(_) => {
-                            std::thread::sleep(std::time::Duration::from_millis(500));
-                        }
+                let mut ok = false;
+                for _ in 0..3 {
+                    if let Ok(mut c) = WingConsole::connect(host2.as_deref()) {
+                        c.keep_alive().ok();
+                        cmd_opt = Some(c);
+                        dead_count = 0;
+                        eprintln!("[wingmon] cmd_wing reconnected");
+                        ok = true;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                if !ok {
+                    dead_count += 1;
+                    eprintln!("[wingmon] cmd_wing reconnect failed ({})", dead_count);
+                    // 5 failed reconnects ≈ 7.5s → Wing is truly gone
+                    if dead_count >= 5 {
+                        eprintln!("[wingmon] Wing appears dead — signalling disconnect");
+                        wing_dead_cmd.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return;
                     }
                 }
             }
         }
     });
 
-    // Live event loop — main thread, runs forever
+
+    // Live event loop — blocks on read() until Wing sends data.
+    // Checks wing_dead flag periodically; exits cleanly when cmd_wing
+    // confirms Wing is truly gone (not just a transient timeout).
     let mut consecutive_errors = 0u32;
     loop {
+        if wing_dead.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("[wingmon] Wing confirmed dead — disconnecting");
+            return Err(libwing::Error::from(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset, "Wing connection lost")));
+        }
         match event_wing.read() {
             Ok(WingResponse::NodeData(id, data)) => {
                 consecutive_errors = 0;
@@ -261,11 +272,10 @@ fn main() -> Result<(), libwing::Error> {
                 consecutive_errors += 1;
                 eprintln!("[wingmon] event_wing error #{}: {}", consecutive_errors, e);
                 if consecutive_errors > 10 {
-                    eprintln!("[wingmon] too many consecutive errors — disconnecting");
+                    eprintln!("[wingmon] disconnecting");
                     return Err(e);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                continue;
+                std::thread::sleep(std::time::Duration::from_millis(500));
             }
         }
     }
