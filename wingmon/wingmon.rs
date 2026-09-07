@@ -146,6 +146,11 @@ fn main() -> Result<(), libwing::Error> {
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
             let Ok(l) = line else { break };
+            // Diagnostic: log first word of every command received on stdin,
+            // so we can confirm Python -> wingmon delivery is working.
+            let verb = l.trim().split(' ').next().unwrap_or("");
+            let len = l.len();
+            eprintln!("[wingmon] stdin recv: {} ({} bytes)", verb, len);
             tx_stdin.send(l).ok();
         }
         eprintln!("[wingmon] stdin EOF - internal keepalive maintains connection");
@@ -197,12 +202,18 @@ fn main() -> Result<(), libwing::Error> {
                         }
                     }
                     if buf.len() > 2 {
-                        if let Err(e) = cmd.write_raw(&buf) {
-                            let s = e.to_string();
-                            if s.contains("10060") || s.contains("timed out") {
-                                std::thread::sleep(std::time::Duration::from_millis(500));
+                        match cmd.write_raw(&buf) {
+                            Ok(_) => {
+                                eprintln!("[wingmon] BATCH_SET sent: {} bytes", buf.len());
                             }
-                            reconnect = true;
+                            Err(e) => {
+                                let s = e.to_string();
+                                eprintln!("[wingmon] BATCH_SET write FAILED: {}", s);
+                                if s.contains("10060") || s.contains("timed out") {
+                                    std::thread::sleep(std::time::Duration::from_millis(500));
+                                }
+                                reconnect = true;
+                            }
                         }
                     }
                 } else if let Some(rest) = trimmed.strip_prefix("SET ") {
