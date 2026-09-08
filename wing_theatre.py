@@ -1475,28 +1475,6 @@ class WingOSC(QObject):
 
         import threading
         threading.Thread(target=_send_batches, daemon=True, name="RecallBatch").start()
-    def _send_param(self, path, value):
-        """Send parameter to Wing via wingmon TCP SET."""
-        if isinstance(value, str):
-            try:    value = int(value)
-            except ValueError:
-                try: value = float(value)
-                except ValueError: pass
-        # Only convert non-negative whole floats to int (color, icon, on/off)
-        # Only convert to int if this is truly a boolean param (not a float param at 0 or 1)
-        float_paths = getattr(self, '_float_paths', set())
-        if isinstance(value, float) and value == int(value) and 0 <= value <= 1 and path not in float_paths:
-            value = int(value)
-        with self._wing_state_lock:
-            self._wing_state[path] = value
-        if isinstance(value, float):
-            vstr = f"{value:.6g}"
-            if '.' not in vstr and 'e' not in vstr:
-                vstr += '.0'
-            cmd = f"SET {path} {vstr}"
-            self._wingmon_stdin(cmd)
-        else:
-            self._wingmon_stdin(f"SET {path} {value}")
 
     def _path_in_scope(self, path, snapshot):
         ch_key    = self._path_to_ch_key(path)
@@ -1601,23 +1579,66 @@ class WingOSC(QObject):
 
     def _unified_step(self):
         """Single timer callback -- steps ALL active fades in the same tick.
-        Interpolates linearly in dB space for visually smooth fader movement."""
+        Interpolates linearly in dB space for visually smooth fader movement.
+
+        All of this tick's values are sent as ONE BATCH_SET instead of one
+        individual SET per fading parameter. With many parameters fading at
+        once (e.g. every fader + every send set to fade together), sending
+        one SET per parameter per 50ms tick means hundreds of individual
+        writes per second for the whole fade -- easily overwhelming Wing's
+        receive pipeline and causing dropped/reordered updates (seen as
+        values jumping around or not landing on the right value). A single
+        combined BATCH_SET per tick cuts that by roughly the number of
+        simultaneously-fading parameters.
+        """
         done = []
+        batch = []   # (path, value) pairs to send this tick
         for job in self._fade_jobs:
             path, start_db, end_db, steps, n = job
             t      = n / (steps - 1) if steps > 1 else 1.0
             db_now = start_db + (end_db - start_db) * t
-            self._send_param(path, db_now)
+            batch.append((path, db_now))
             job[4] = n + 1
             if n + 1 >= steps:
-                self._send_param(path, end_db)   # exact target
+                # db_now already equals end_db here (t == 1.0) -- no need to
+                # send it a second time.
                 done.append(job)
+
+        if batch:
+            self._send_params_batch(batch)
 
         for job in done:
             self._fade_jobs.remove(job)
 
         if not self._fade_jobs:
             self._unified_timer.stop()
+
+    def _send_params_batch(self, pairs):
+        """Send multiple (path, value) pairs to Wing in a single BATCH_SET,
+        instead of one SET command per pair. Used by the fade engine so a
+        tick with many simultaneously-fading parameters costs one write
+        instead of many. Also updates _wing_state for each pair."""
+        float_paths = getattr(self, '_float_paths', set())
+        parts = []
+        for path, value in pairs:
+            if isinstance(value, str):
+                try:    value = int(value)
+                except ValueError:
+                    try: value = float(value)
+                    except ValueError: pass
+            if isinstance(value, float) and value == int(value) and 0 <= value <= 1 and path not in float_paths:
+                value = int(value)
+            with self._wing_state_lock:
+                self._wing_state[path] = value
+            if isinstance(value, float):
+                vstr = f"{value:.6g}"
+                if '.' not in vstr and 'e' not in vstr:
+                    vstr += '.0'
+            else:
+                vstr = str(value)
+            parts.append(f"{path}={vstr}")
+        if parts:
+            self._wingmon_stdin(f"BATCH_SET {','.join(parts)}")
 
     def _cancel_all_fades(self):
         for job in self._fade_jobs:
@@ -5458,7 +5479,16 @@ class MainWindow(QMainWindow):
         expiry = self._fading_paths.get(path)
         if expiry is not None:
             import time as _time
-            if _time.time() < expiry:
+            now = _time.time()
+            if now < expiry:
+                # Diagnostic: log occasionally so we can see if this guard
+                # is over-firing (blocking values long after any real fade
+                # should have finished).
+                remaining = expiry - now
+                if remaining > 2.0:
+                    self.status_bar.showMessage(
+                        f"⚠ AU suppressed for {path} -- {remaining:.1f}s left "
+                        f"in fade window (longer than expected)", 4000)
                 return
             del self._fading_paths[path]   # expired -- stop tracking it
 
