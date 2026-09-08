@@ -20,6 +20,9 @@ MIT
 ## Downloads
 See [Releases](../../releases) for pre-built binaries for macOS and Windows.
 
+## User Manual
+📖 [Wing Theatre Controller Manual](./Wing-Theatre-Controller-Manual.docx) — full guide for sound engineers: installation, connecting to the Wing, cue lists, Recall Scope, fades, Auto Update, and OSC/Companion remote control.
+
 ## Structure
 ```
 wing_theatre.py          ← Main application (Python/PyQt6)
