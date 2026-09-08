@@ -774,6 +774,14 @@ class WingOSC(QObject):
         self._learned_poll_paths = []
         self._fades         = []
         self._fade_jobs     = []
+        # path -> timestamp until which live events for that path are ignored
+        # by Auto Update. More robust than checking _fade_jobs membership
+        # directly: a fade's job is removed from _fade_jobs the instant the
+        # final tick is SENT, but Wing's echo of that (and the last couple
+        # of ticks before it) can arrive back over the network afterwards --
+        # especially on Windows, where this lag is more noticeable. The grace
+        # period below covers that gap so trailing echoes are still ignored.
+        self._fading_paths  = {}
         self._unified_timer = QTimer(self)
         self._unified_timer.timeout.connect(self._unified_step)
         # Thread-safe signal routing
@@ -1582,6 +1590,12 @@ class WingOSC(QObject):
         """Queue a fade -- interpolates linearly in dB space for smooth visual movement."""
         steps = max(2, int(fade_secs * fps))
         self._fade_jobs.append([path, float(start_db), float(end_db), steps, 0])
+        # Suppress Auto Update writes for this path until well after the fade
+        # visually finishes, to absorb Wing's echo round-trip delay for the
+        # trailing ticks (see comment at _fading_paths declaration).
+        import time as _time
+        GRACE_SECS = 0.75
+        self._fading_paths[path] = _time.time() + fade_secs + GRACE_SECS
         if not self._unified_timer.isActive():
             self._unified_timer.start(int(1000 / fps))
 
@@ -1606,6 +1620,8 @@ class WingOSC(QObject):
             self._unified_timer.stop()
 
     def _cancel_all_fades(self):
+        for job in self._fade_jobs:
+            self._fading_paths.pop(job[0], None)
         self._unified_timer.stop()
         self._fade_jobs.clear()
 
@@ -5436,8 +5452,15 @@ class MainWindow(QMainWindow):
         # Without this guard, Auto Update would treat those intermediate
         # fade steps as real console moves and write the mid-fade value
         # into the snapshot instead of the fade's actual target value.
-        if any(job[0] == path for job in self._fade_jobs):
-            return
+        # Time-window based (not just "is a job still active") so trailing
+        # echoes that arrive after the fade visually finishes are still
+        # caught -- see _fading_paths declaration for why that matters.
+        expiry = self._fading_paths.get(path)
+        if expiry is not None:
+            import time as _time
+            if _time.time() < expiry:
+                return
+            del self._fading_paths[path]   # expired -- stop tracking it
 
         scope_key = self.osc._path_to_scope_key(path)
         ch_key    = self.osc._path_to_ch_key(path)
