@@ -5326,6 +5326,16 @@ class MainWindow(QMainWindow):
         # Explicit AU guard -- should never be called with AU off
         if not self.osc._auto_update:
             return
+
+        # Ignore echoes from our own fade engine. When a cue recall fades a
+        # fader/send over time, each step is sent to Wing via SET, and Wing
+        # echoes every change back as a live event on the same connection.
+        # Without this guard, Auto Update would treat those intermediate
+        # fade steps as real console moves and write the mid-fade value
+        # into the snapshot instead of the fade's actual target value.
+        if any(job[0] == path for job in self._fade_jobs):
+            return
+
         scope_key = self.osc._path_to_scope_key(path)
         ch_key    = self.osc._path_to_ch_key(path)
         if not scope_key or not ch_key:
