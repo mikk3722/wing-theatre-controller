@@ -678,7 +678,6 @@ class WingOSC(QObject):
     connection_lost    = pyqtSignal()
     connection_ready   = pyqtSignal()   # emitted on main thread after connect
     capture_finished   = pyqtSignal()   # emitted from wingmon thread -> finish on main
-    capture_finished   = pyqtSignal()   # emitted from wingmon thread -> finish on main
     sync_complete      = pyqtSignal(int)   # initial state sync done (param count)
     WING_PORT    = 2223
     WINGMON_PATH = _find_wingmon_path()
@@ -747,6 +746,15 @@ class WingOSC(QObject):
         self.local_ip       = "0.0.0.0"   # set on connect
         self.is_connected   = False
         self._wing_state    = {}
+        # _wing_state is written from the wingmon background thread (every
+        # live event) and iterated/copied from the main thread (Add Snap,
+        # Update from Wing, Auto Update, fade start-value lookups). Without
+        # this lock, a live event arriving mid-iteration can raise
+        # "RuntimeError: dictionary changed size during iteration" and
+        # crash the app -- this was intermittent and hit more easily on
+        # Windows due to differing thread scheduling.
+        self._wing_state_lock = threading.Lock()
+        self._capture_buf_lock = threading.Lock()  # same race risk as _wing_state, during "Store from Wing"
         self._auto_update   = False
         self._auto_update_count = 0
         self._au_baseline   = {}
@@ -772,39 +780,6 @@ class WingOSC(QObject):
         self._prop_lookup   = {}
         self._dyn_models    = {}   # {(ch_path, section): model_name}
 
-    # ── OSC message builders ──────────────────────────────────────────────────
-
-    @staticmethod
-    @staticmethod
-    @staticmethod
-    def _on_message(self, address, value):
-        if value is None:
-            return
-        self._wing_state[address] = value
-
-        # Track model from OSC: /ch/1/eq/mdl = STD
-        if address.endswith('/mdl') and isinstance(value, str):
-            parts = address.split('/')
-            if len(parts) >= 5 and parts[3] in ('eq','gate','dyn','flt'):
-                self._dyn_models[('/' + '/'.join(parts[1:3]), parts[3])] = value.strip()
-            elif len(parts) >= 4 and parts[1] == 'fx':
-                self._dyn_models[('/fx/' + parts[2], 'fx')] = value.strip()
-
-
-        if self._capturing:
-            self._capture_buf[address] = value
-            self._au_baseline[address] = value
-            return
-        if not self._auto_update:
-            self._au_baseline[address] = value
-            return
-        baseline_val = self._au_baseline.get(address)
-        if baseline_val is not None and self._approx_equal(baseline_val, value):
-            return
-        self._au_baseline[address] = value
-        self._auto_update_count += 1
-        self.parameter_received.emit(address, value)
-
     def set_auto_update(self, enabled, poll_paths=None):
         """
         Toggle AU. Wingmon handles ALL real-time push events.
@@ -822,7 +797,9 @@ class WingOSC(QObject):
         if not enabled:
             return
         # Populate baseline from current wing_state
-        for k, v in self._wing_state.items():
+        with self._wing_state_lock:
+            snapshot_items = list(self._wing_state.items())
+        for k, v in snapshot_items:
             if k not in self._au_baseline:
                 self._au_baseline[k] = v
         wingmon_running = bool(getattr(self, "_wingmon_proc", None))
@@ -908,7 +885,8 @@ class WingOSC(QObject):
                 try: t.stop()
                 except: pass
         self._cancel_all_fades()
-        self._wing_state.clear()
+        with self._wing_state_lock:
+            self._wing_state.clear()
         self._au_baseline.clear()
         self._dyn_models.clear()
         self.connected.emit(False)
@@ -1109,9 +1087,11 @@ class WingOSC(QObject):
                                 except ValueError:
                                     value = val_str
                                 if self._capturing:
-                                    self._capture_buf[path] = value
+                                    with self._capture_buf_lock:
+                                        self._capture_buf[path] = value
                                     self._au_baseline[path] = value
-                                self._wing_state[path] = value
+                                with self._wing_state_lock:
+                                    self._wing_state[path] = value
                         continue
 
                     if " = " not in rest:
@@ -1143,9 +1123,11 @@ class WingOSC(QObject):
                     # Convert native wingmon paths to OSC format
                     path = path
                     if self._capturing:
-                        self._capture_buf[path] = value
+                        with self._capture_buf_lock:
+                            self._capture_buf[path] = value
                         self._au_baseline[path] = value
-                    self._wing_state[path] = value
+                    with self._wing_state_lock:
+                        self._wing_state[path] = value
                     continue
 
                 # ── Resolve anonymous propN ───────────────────────────────────
@@ -1227,7 +1209,8 @@ class WingOSC(QObject):
 
     def _emit_wing_event(self, path, value):
         """Store Wing event in _wing_state. Always updated, AU only writes to snapshot."""
-        self._wing_state[path] = value
+        with self._wing_state_lock:
+            self._wing_state[path] = value
         self._live_event_count = getattr(self, '_live_event_count', 0) + 1
 
         # Update title bar every 100 events so user can see events arriving
@@ -1346,8 +1329,9 @@ class WingOSC(QObject):
 
     def _finish_capture(self):
         self._capturing = False
-        data = dict(self._capture_buf)
-        self._capture_buf = {}
+        with self._capture_buf_lock:
+            data = dict(self._capture_buf)
+            self._capture_buf = {}
 
         if data:
             self._learned_poll_paths = sorted(data.keys())
@@ -1409,7 +1393,8 @@ class WingOSC(QObject):
                     _fp = getattr(self, '_float_paths', set())
                     if path not in _fp:
                         v = int(v)
-                self._wing_state[path] = v
+                with self._wing_state_lock:
+                    self._wing_state[path] = v
                 if isinstance(v, float):
                     vstr = f"{v:.6g}"
                     # Ensure decimal so wingmon uses set_float not set_int
@@ -1478,7 +1463,8 @@ class WingOSC(QObject):
         float_paths = getattr(self, '_float_paths', set())
         if isinstance(value, float) and value == int(value) and 0 <= value <= 1 and path not in float_paths:
             value = int(value)
-        self._wing_state[path] = value
+        with self._wing_state_lock:
+            self._wing_state[path] = value
         if isinstance(value, float):
             vstr = f"{value:.6g}"
             if '.' not in vstr and 'e' not in vstr:
@@ -4816,7 +4802,8 @@ class MainWindow(QMainWindow):
             if ok and name.strip():
                 n = len(self.show_file.snapshots) + 1
                 snap = Snapshot(name.strip(), n)
-                snap.data = dict(self.osc._wing_state)
+                with self.osc._wing_state_lock:
+                    snap.data = dict(self.osc._wing_state)
                 self.show_file.snapshots.append(snap)
                 self._mark_dirty()
                 self._refresh_cue_list()
@@ -5187,7 +5174,8 @@ class MainWindow(QMainWindow):
         snap_name = name.strip() if name.strip() else f"Scene {n:03d}"
         snap = Snapshot(snap_name, n)
         if self.osc._wing_state:
-            snap.data = dict(self.osc._wing_state)
+            with self.osc._wing_state_lock:
+                snap.data = dict(self.osc._wing_state)
         self.show_file.snapshots.append(snap)
         self._mark_dirty()
         self._refresh_cue_list()
@@ -5229,7 +5217,8 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage(
                 "Wing state not ready -- wait for sync to complete", 4000)
             return
-        snap.data = dict(self.osc._wing_state)
+        with self.osc._wing_state_lock:
+            snap.data = dict(self.osc._wing_state)
         self._mark_dirty()
         live_events = getattr(self.osc, '_live_event_count', 0)
         self.status_bar.showMessage(
