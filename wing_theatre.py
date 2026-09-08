@@ -2843,11 +2843,20 @@ class RecallScopeWidget(QWidget):
             import traceback; traceback.print_exc()
 
     def _set_all_scope(self, value):
-        """Set all scope keys on/off for the current snapshot."""
+        """Set all scope keys on/off for the current snapshot.
+
+        Also clears per-channel/group overrides -- otherwise an inherited
+        exception (e.g. "Sends off for buses only", copied in from the
+        Default scope) would keep showing as excluded even after Select All,
+        since a per-channel override always takes priority over the global
+        scope value when the grid renders each cell.
+        """
         if not self.snapshot:
             return
         for k in WING_SCOPE_KEYS:
             self.snapshot.scope[k] = value
+        for cs in self.snapshot.channel_scopes.values():
+            cs.overrides.clear()
         self._rebuild(restore_expansion=True)
         self.scope_changed.emit()
 
