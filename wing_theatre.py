@@ -774,13 +774,12 @@ class WingOSC(QObject):
         self._learned_poll_paths = []
         self._fades         = []
         self._fade_jobs     = []
-        # path -> timestamp until which live events for that path are ignored
-        # by Auto Update. More robust than checking _fade_jobs membership
-        # directly: a fade's job is removed from _fade_jobs the instant the
-        # final tick is SENT, but Wing's echo of that (and the last couple
-        # of ticks before it) can arrive back over the network afterwards --
-        # especially on Windows, where this lag is more noticeable. The grace
-        # period below covers that gap so trailing echoes are still ignored.
+        # path -> {"target": end_db, "deadline": timestamp}. While a path is
+        # fading, Auto Update ignores live events for it UNTIL the incoming
+        # value actually matches "target" (the fade's real destination) --
+        # far more reliable than guessing how long Wing's echo round-trip
+        # takes. "deadline" is only a safety fallback so a path can't stay
+        # suppressed forever if the target is somehow never seen.
         self._fading_paths  = {}
         self._unified_timer = QTimer(self)
         self._unified_timer.timeout.connect(self._unified_step)
@@ -1568,12 +1567,21 @@ class WingOSC(QObject):
         """Queue a fade -- interpolates linearly in dB space for smooth visual movement."""
         steps = max(2, int(fade_secs * fps))
         self._fade_jobs.append([path, float(start_db), float(end_db), steps, 0])
-        # Suppress Auto Update writes for this path until well after the fade
-        # visually finishes, to absorb Wing's echo round-trip delay for the
-        # trailing ticks (see comment at _fading_paths declaration).
+        # Suppress Auto Update writes for this path until we actually see the
+        # fade's real target value come back from Wing -- not just "some
+        # amount of time has passed". We know exactly what value the fade is
+        # heading to (end_db), so instead of guessing how long Wing's echo
+        # round-trip takes, we just wait to see that exact value arrive.
+        # A generous safety deadline is kept as a fallback only, in case the
+        # target is never seen (fade interrupted, connection hiccup, Wing
+        # quantizes to a slightly different value, etc.) so a path can never
+        # get stuck suppressed forever.
         import time as _time
-        GRACE_SECS = 0.75
-        self._fading_paths[path] = _time.time() + fade_secs + GRACE_SECS
+        SAFETY_MARGIN = 1.0
+        self._fading_paths[path] = {
+            "target":   float(end_db),
+            "deadline": _time.time() + fade_secs + SAFETY_MARGIN,
+        }
         if not self._unified_timer.isActive():
             self._unified_timer.start(int(1000 / fps))
 
@@ -5487,19 +5495,31 @@ class MainWindow(QMainWindow):
         # Without this guard, Auto Update would treat those intermediate
         # fade steps as real console moves and write the mid-fade value
         # into the snapshot instead of the fade's actual target value.
-        # Time-window based (not just "is a job still active") so trailing
-        # echoes that arrive after the fade visually finishes are still
-        # caught -- see _fading_paths declaration for why that matters.
-        expiry = self._fading_paths.get(path)
-        if expiry is not None:
+        #
+        # We know exactly what value the fade is heading to, so instead of
+        # guessing a time window, we suppress writes for this path until we
+        # actually SEE that target value arrive from Wing -- then release
+        # the guard immediately. A safety deadline is a fallback only, so a
+        # path can't stay stuck suppressed forever if the target is somehow
+        # never reached (interrupted fade, connection hiccup, Wing rounding
+        # to a slightly different step than requested).
+        info = self._fading_paths.get(path)
+        if info is not None:
             import time as _time
             now = _time.time()
-            if now < expiry:
-                remaining = expiry - now
+            if self.osc._approx_equal(value, info["target"]):
+                del self._fading_paths[path]
                 self.log_message.emit(
-                    f"AU: suppressed {path} -- {remaining:.2f}s left in fade window")
+                    f"AU: fade reached target for {path} -- resuming normal AU")
                 return
-            del self._fading_paths[path]   # expired -- stop tracking it
+            if now < info["deadline"]:
+                self.log_message.emit(
+                    f"AU: suppressed {path} = {value} (mid-fade, target={info['target']:.3g})")
+                return
+            # Safety timeout -- give up waiting and process this as a real event
+            del self._fading_paths[path]
+            self.log_message.emit(
+                f"AU: fade guard timed out for {path} -- resuming normal AU")
 
         scope_key = self.osc._path_to_scope_key(path)
         ch_key    = self.osc._path_to_ch_key(path)
