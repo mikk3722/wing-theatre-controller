@@ -466,13 +466,20 @@ class ShowFile:
         self.osc_outputs = []
         self.groups     = []   # ordered list of group names (persists independently of snapshots)
         self.filepath   = None
+        # App-level UI settings persisted per show: Wing IP/interface, OSC/TCP
+        # remote control ports + on-off state, autosave interval, and the
+        # customised Default Recall Scope (edited via right-click Default).
+        # Populated by MainWindow._collect_app_settings() just before saving,
+        # and applied back by MainWindow._apply_app_settings() after loading.
+        self.app_settings = {}
 
     def to_dict(self):
         return {"name":self.name,
                 "groups": self.groups,
                 "snapshots":[s.to_dict() for s in self.snapshots],
                 "sections": [s.to_dict() for s in self.sections],
-                "osc_outputs":[o.to_dict() for o in self.osc_outputs]}
+                "osc_outputs":[o.to_dict() for o in self.osc_outputs],
+                "app_settings": self.app_settings}
 
     def save(self, fp):
         with open(fp,"w") as f: json.dump(self.to_dict(),f,indent=2)
@@ -491,6 +498,7 @@ class ShowFile:
         s.snapshots  = [Snapshot.from_dict(x) for x in d.get("snapshots",[])]
         s.sections   = [Section.from_dict(x)  for x in d.get("sections",[])]
         s.osc_outputs = [OscOutput.from_dict(x) for x in d.get("osc_outputs",[])]
+        s.app_settings = d.get("app_settings", {})   # missing on older show files -- fine, just empty
         # Ensure any group used in a snapshot also exists in the groups list
         for snap in s.snapshots:
             g = (snap.cue_group or "").strip()
@@ -786,6 +794,14 @@ class WingOSC(QObject):
         OSC polling is ONLY used in start_capture (Store from Wing).
         If wingmon is not running, AU shows a warning but does NOT fall back to polling.
         """
+        try:
+            self._set_auto_update_impl(enabled, poll_paths)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.log_message.emit(f"⚠ Auto Update error: {e}")
+
+    def _set_auto_update_impl(self, enabled, poll_paths=None):
         self._auto_update = enabled
         self._auto_update_count = 0
         # Stop any leftover timers from old sessions
@@ -4700,6 +4716,7 @@ class MainWindow(QMainWindow):
     def _autosave(self):
         if self.show_file.filepath and self._dirty:
             try:
+                self._collect_app_settings()
                 self.show_file.save(self.show_file.filepath)
                 self._mark_clean()
                 self.status_bar.showMessage(
@@ -4737,6 +4754,78 @@ class MainWindow(QMainWindow):
         self._refresh_cue_list()
         self.cue_panel.set_current(snap_idx + 1)
 
+    def _collect_app_settings(self):
+        """Gather current UI/app-level settings into self.show_file.app_settings,
+        called right before saving. Covers everything that isn't per-snapshot
+        data: connection info, remote-control ports, autosave, and the
+        customised Default Recall Scope (right-click Default to edit)."""
+        try:
+            osp = self.osc_settings_panel
+            self.show_file.app_settings = {
+                "wing_ip":    self.conn_panel.ip_input.text().strip(),
+                "iface_ip":   self.conn_panel.iface_combo.currentData(),
+                "osc_remote_port":    osp.rc_port.value(),
+                "osc_remote_enabled": bool(getattr(osp, '_osc_server', None)
+                                           and osp._osc_server.is_running()),
+                "tcp_remote_port":    osp.tcp_port.value(),
+                "tcp_remote_enabled": bool(self.tcp_server._running),
+                "autosave_minutes":   self._autosave_spin.value(),
+                "default_scope":        dict(DEFAULT_SCOPE),
+                "default_channel_scopes": {k: v.to_dict() for k, v in DEFAULT_CHANNEL_SCOPES.items()},
+                "default_fx_scope":      dict(DEFAULT_FX_SCOPE),
+                "default_cfg_scope":     dict(DEFAULT_CFG_SCOPE),
+                "default_group_fades":   {k: dict(v) for k, v in DEFAULT_GROUP_FADES.items()},
+            }
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
+    def _apply_app_settings(self):
+        """Apply self.show_file.app_settings to the UI and DEFAULT_* globals
+        after loading a show. Missing keys (older show files, or a fresh New
+        Show) are left untouched -- current in-memory values are kept."""
+        s = getattr(self.show_file, 'app_settings', None)
+        if not s:
+            return
+        try:
+            if "wing_ip" in s and s["wing_ip"]:
+                self.conn_panel.ip_input.setText(s["wing_ip"])
+            if "iface_ip" in s:
+                idx = self.conn_panel.iface_combo.findData(s["iface_ip"])
+                if idx >= 0:
+                    self.conn_panel.iface_combo.setCurrentIndex(idx)
+
+            osp = self.osc_settings_panel
+            if "osc_remote_port" in s:
+                osp.rc_port.setValue(int(s["osc_remote_port"]))
+            if "tcp_remote_port" in s:
+                osp.tcp_port.setValue(int(s["tcp_remote_port"]))
+            if s.get("osc_remote_enabled") and hasattr(osp, '_osc_server') \
+                    and not osp._osc_server.is_running():
+                osp._rc_toggle()
+            if s.get("tcp_remote_enabled") and not self.tcp_server._running:
+                self._tcp_toggle(osp.tcp_port.value())
+
+            if "autosave_minutes" in s:
+                self._autosave_spin.setValue(int(s["autosave_minutes"]))
+
+            if "default_scope" in s:
+                DEFAULT_SCOPE.clear(); DEFAULT_SCOPE.update(s["default_scope"])
+            if "default_channel_scopes" in s:
+                DEFAULT_CHANNEL_SCOPES.clear()
+                DEFAULT_CHANNEL_SCOPES.update(
+                    {k: ChannelScope.from_dict(v) for k, v in s["default_channel_scopes"].items()})
+            if "default_fx_scope" in s:
+                DEFAULT_FX_SCOPE.clear(); DEFAULT_FX_SCOPE.update(s["default_fx_scope"])
+            if "default_cfg_scope" in s:
+                DEFAULT_CFG_SCOPE.clear(); DEFAULT_CFG_SCOPE.update(s["default_cfg_scope"])
+            if "default_group_fades" in s:
+                for gk, fades in s["default_group_fades"].items():
+                    DEFAULT_GROUP_FADES[gk] = dict(fades)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
     def _new_show(self):
         if not self._ask_save():
             return
@@ -4755,6 +4844,7 @@ class MainWindow(QMainWindow):
         self.sections_panel.refresh()
         self.osc_settings_panel.refresh()
         self._refresh_cue_list()
+        self._apply_app_settings()
 
     def _open_show(self):
         if not self._ask_save(): return
@@ -4770,6 +4860,7 @@ class MainWindow(QMainWindow):
             except Exception as e: QMessageBox.critical(self,"Error",f"Could not open:\n{e}")
 
     def _save_show(self):
+        self._collect_app_settings()
         if self.show_file.filepath:
             self.show_file.save(self.show_file.filepath)
             self._mark_clean()
@@ -4778,6 +4869,7 @@ class MainWindow(QMainWindow):
         else: self._save_show_as()
 
     def _save_show_as(self):
+        self._collect_app_settings()
         from PyQt6.QtWidgets import QFileDialog
         path,_ = QFileDialog.getSaveFileName(self,"Save Show As",
             f"{self.show_file.name}.wts","Wing Theatre Show (*.wts);;All Files (*)")
@@ -5281,25 +5373,30 @@ class MainWindow(QMainWindow):
 
     def _on_auto_update_changed(self, enabled):
         """Start/stop auto-update polling with scope-relevant paths."""
-        if enabled:
-            idx = self.cue_panel.active_index
-            if idx < 0:
-                idx = self.cue_panel.current_index
-            paths = None
-            if 0 <= idx < len(self.show_file.snapshots):
-                snap = self.show_file.snapshots[idx]
-                if snap.data:
-                    paths = [p for p in snap.data.keys()
-                             if self.osc._path_in_scope(p, snap)]
-                    # Sort: faders+mutes first, then EQ, then rest
-                    def _prio(p):
-                        if p.endswith('/fdr') or p.endswith('/mute'): return 0
-                        if '/eq/' in p or p.endswith('/eq/on'):        return 1
-                        return 2
-                    paths.sort(key=_prio)
-            self.osc.set_auto_update(True, paths)
-        else:
-            self.osc.set_auto_update(False)
+        try:
+            if enabled:
+                idx = self.cue_panel.active_index
+                if idx < 0:
+                    idx = self.cue_panel.current_index
+                paths = None
+                if 0 <= idx < len(self.show_file.snapshots):
+                    snap = self.show_file.snapshots[idx]
+                    if snap.data:
+                        paths = [p for p in snap.data.keys()
+                                 if self.osc._path_in_scope(p, snap)]
+                        # Sort: faders+mutes first, then EQ, then rest
+                        def _prio(p):
+                            if p.endswith('/fdr') or p.endswith('/mute'): return 0
+                            if '/eq/' in p or p.endswith('/eq/on'):        return 1
+                            return 2
+                        paths.sort(key=_prio)
+                self.osc.set_auto_update(True, paths)
+            else:
+                self.osc.set_auto_update(False)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.status_bar.showMessage(f"⚠ Auto Update toggle error: {e}", 6000)
 
     def _get_active_section(self):
         """Return the currently selected Section from SectionsPanel, or None."""
@@ -5311,7 +5408,24 @@ class MainWindow(QMainWindow):
     def _on_parameter_received(self, path, value):
         """Auto Update -- write to snapshots.
         Only runs when AU is ON. Guards against spurious calls.
+
+        This runs as a Qt slot via a queued connection from the wingmon
+        background thread. An unhandled exception raised here does not just
+        get logged and skipped -- PyQt can treat it as fatal and bring down
+        the whole application, since the exception has nowhere safe to go
+        once it crosses back into Qt's event loop. So the entire body is
+        guarded: on any error we log it and drop this one event, instead of
+        risking a full crash of the app.
         """
+        try:
+            self._on_parameter_received_impl(path, value)
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            self.log_message.emit(f"⚠ Auto Update error (ignored): {e}")
+            print(tb)  # full traceback for diagnostics, if a console is attached
+
+    def _on_parameter_received_impl(self, path, value):
         # Explicit AU guard -- should never be called with AU off
         if not self.osc._auto_update:
             return
@@ -5396,6 +5510,30 @@ class MainWindow(QMainWindow):
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
 def main():
+    import traceback, datetime
+
+    def _log_crash(exc_type, exc_value, exc_tb):
+        """Catch-all safety net: on Windows especially, an unhandled exception
+        in a Qt slot can otherwise kill the whole app with no visible error.
+        Write full details to crash_log.txt next to the app so it can be
+        sent back for diagnosis, and still print to stderr if a console
+        happens to be attached."""
+        try:
+            base = os.path.dirname(os.path.abspath(
+                sys.executable if getattr(sys, 'frozen', False) else __file__))
+            log_path = os.path.join(base, 'crash_log.txt')
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(f"\n--- {datetime.datetime.now().isoformat()} ---\n")
+                traceback.print_exception(exc_type, exc_value, exc_tb, file=f)
+        except Exception:
+            pass
+        try:
+            traceback.print_exception(exc_type, exc_value, exc_tb)
+        except Exception:
+            pass
+
+    sys.excepthook = _log_crash
+
     app = QApplication(sys.argv); app.setStyle("Fusion")
     pal = QPalette()
     pal.setColor(QPalette.ColorRole.Window,          QColor(C['bg']))
