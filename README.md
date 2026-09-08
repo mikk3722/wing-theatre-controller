@@ -4,7 +4,7 @@ Professional show-control software for Behringer Wing mixer.
 DiGiCo-inspired: snapshots/cues, GO, Auto Update, Recall Scope, Fades, OSC/TCP control.
 
 ## Developers
-- **Mikkel Peter Larsen**
+- **Mikkel Peter Larsen** - wing-theatre-controller@mikkelpeterlarsen.dk
 - **Claude** (Anthropic — claude.ai)
 
 ## Credits
