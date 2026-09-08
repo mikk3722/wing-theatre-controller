@@ -4013,7 +4013,21 @@ class SectionsPanel(QWidget):
             self.excl_table.clearContents()
             self.sections_changed.emit()
 
-    def refresh(self): self._refresh_list()
+    def refresh(self):
+        prev_row = self.sec_list.currentRow()
+        self._refresh_list()
+        # _refresh_list() clears and rebuilds the list, which loses the
+        # selection every time -- including right after loading a show file.
+        # With nothing selected, _get_active_section() silently returns None
+        # and Auto Update falls back to 'snap' mode for every parameter type,
+        # ignoring any configured group/all write-mode AND any channel
+        # restriction entirely (that check is skipped when section is None).
+        # Restore the previous selection if still valid, otherwise default
+        # to the first section so AU always has a well-defined active section
+        # instead of silently losing custom exclusions/channel restrictions.
+        if self.sec_list.count() > 0:
+            row = prev_row if 0 <= prev_row < self.sec_list.count() else 0
+            self.sec_list.setCurrentRow(row)
 
 
 # ─── Main Window ──────────────────────────────────────────────────────────────
@@ -5481,14 +5495,9 @@ class MainWindow(QMainWindow):
             import time as _time
             now = _time.time()
             if now < expiry:
-                # Diagnostic: log occasionally so we can see if this guard
-                # is over-firing (blocking values long after any real fade
-                # should have finished).
                 remaining = expiry - now
-                if remaining > 2.0:
-                    self.status_bar.showMessage(
-                        f"⚠ AU suppressed for {path} -- {remaining:.1f}s left "
-                        f"in fade window (longer than expected)", 4000)
+                self.log_message.emit(
+                    f"AU: suppressed {path} -- {remaining:.2f}s left in fade window")
                 return
             del self._fading_paths[path]   # expired -- stop tracking it
 
@@ -5541,6 +5550,9 @@ class MainWindow(QMainWindow):
                 snap.data[path] = value
                 changed = True
         if changed:
+            if scope_key in ('fader', 'sends'):
+                self.log_message.emit(
+                    f"AU: wrote {path} = {value} to {len(targets)} cue(s)")
             self._mark_dirty()
 
     def _recall(self):
