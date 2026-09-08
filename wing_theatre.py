@@ -5481,7 +5481,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             import traceback
             tb = traceback.format_exc()
-            self.log_message.emit(f"⚠ Auto Update error (ignored): {e}")
+            self.status_bar.showMessage(f"⚠ Auto Update error (ignored): {e}", 6000)
             print(tb)  # full traceback for diagnostics, if a console is attached
 
     def _on_parameter_received_impl(self, path, value):
@@ -5503,23 +5503,25 @@ class MainWindow(QMainWindow):
         # path can't stay stuck suppressed forever if the target is somehow
         # never reached (interrupted fade, connection hiccup, Wing rounding
         # to a slightly different step than requested).
-        info = self._fading_paths.get(path)
+        # _fade_jobs/_fading_paths live on self.osc (WingOSC), not on
+        # MainWindow -- that's where _start_fade/_unified_step also live.
+        info = self.osc._fading_paths.get(path)
         if info is not None:
             import time as _time
             now = _time.time()
             if self.osc._approx_equal(value, info["target"]):
-                del self._fading_paths[path]
-                self.log_message.emit(
-                    f"AU: fade reached target for {path} -- resuming normal AU")
+                del self.osc._fading_paths[path]
+                self.status_bar.showMessage(
+                    f"AU: fade reached target for {path} -- resuming normal AU", 2000)
                 return
             if now < info["deadline"]:
-                self.log_message.emit(
-                    f"AU: suppressed {path} = {value} (mid-fade, target={info['target']:.3g})")
+                self.status_bar.showMessage(
+                    f"AU: suppressed {path} = {value} (mid-fade, target={info['target']:.3g})", 1500)
                 return
             # Safety timeout -- give up waiting and process this as a real event
-            del self._fading_paths[path]
-            self.log_message.emit(
-                f"AU: fade guard timed out for {path} -- resuming normal AU")
+            del self.osc._fading_paths[path]
+            self.status_bar.showMessage(
+                f"AU: fade guard timed out for {path} -- resuming normal AU", 3000)
 
         scope_key = self.osc._path_to_scope_key(path)
         ch_key    = self.osc._path_to_ch_key(path)
@@ -5571,8 +5573,8 @@ class MainWindow(QMainWindow):
                 changed = True
         if changed:
             if scope_key in ('fader', 'sends'):
-                self.log_message.emit(
-                    f"AU: wrote {path} = {value} to {len(targets)} cue(s)")
+                self.status_bar.showMessage(
+                    f"AU: wrote {path} = {value} to {len(targets)} cue(s)", 1500)
             self._mark_dirty()
 
     def _recall(self):
