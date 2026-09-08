@@ -1387,16 +1387,33 @@ class WingOSC(QObject):
 
             if fade_t > 0.01 and isinstance(value, (int, float)):
                 current = self._wing_state.get(path, value)
-                if abs(float(current) - float(value)) > 0.01:
-                    self._start_fade(path, float(current), float(value), fade_t)
+                current = float(current)
+                target  = float(value)
+                # Guard against -inf/+inf/NaN as a fade start OR end value.
+                # If Wing sends the literal string "-inf" for a fader at
+                # silence, Python's float() happily parses that to real
+                # negative infinity -- and interpolating to/from infinity
+                # produces NaN for the whole fade ("-inf + inf" is
+                # undefined), which Wing then can't parse, so the fader
+                # doesn't move at all until the final tick sends the real
+                # target value directly, looking like a sudden jump. Clamp
+                # both ends to Wing's practical floor/ceiling instead so the
+                # fade always has real finite endpoints.
+                import math
+                if not math.isfinite(current):
+                    current = -144.0 if current < 0 else 144.0
+                if not math.isfinite(target):
+                    target = -144.0 if target < 0 else 144.0
+                if abs(current - target) > 0.01:
+                    self._start_fade(path, current, target, fade_t)
                     faded_paths.add(path)
                     if scope_key == 'fader':
                         mute_path = path.replace('/fdr', '/mute')
                         mute_val  = snapshot.data.get(mute_path)
                         if mute_val is not None and self._path_in_scope(mute_path, snapshot):
                             prev_mute   = int(self._wing_state.get(mute_path, 0))
-                            fading_down = float(value) < float(current) - 0.5
-                            fading_up   = float(value) > float(current) + 0.5
+                            fading_down = target < current - 0.5
+                            fading_up   = target > current + 0.5
                             target_mute = int(mute_val)
                             if fading_down and target_mute == 1 and prev_mute == 0:
                                 delayed_cmds.append((int(fade_t * 950), mute_path, 1))
@@ -1563,7 +1580,7 @@ class WingOSC(QObject):
         if amp <= 0: return -144.0
         return 20.0 * math.log10(max(amp, 1e-8))
 
-    def _start_fade(self, path, start_db, end_db, fade_secs, fps=20):
+    def _start_fade(self, path, start_db, end_db, fade_secs, fps=40):
         """Queue a fade -- interpolates linearly in dB space for smooth visual movement."""
         steps = max(2, int(fade_secs * fps))
         self._fade_jobs.append([path, float(start_db), float(end_db), steps, 0])
@@ -1585,15 +1602,46 @@ class WingOSC(QObject):
         if not self._unified_timer.isActive():
             self._unified_timer.start(int(1000 / fps))
 
+    # Fade curve tuning: the -30..0dB range gets more of the available
+    # steps than the same dB distance below -30, since that's where level
+    # changes are actually audible/visible -- the -144..-30 range is mostly
+    # silence anyway, so it doesn't need fine resolution.
+    _FADE_BREAK_DB = -30.0
+    _FADE_BOOST    = 3.0   # -30..0 gets ~3x the step density of below -30
+
+    @classmethod
+    def _db_to_weighted(cls, db):
+        if db <= cls._FADE_BREAK_DB:
+            return db
+        return cls._FADE_BREAK_DB + (db - cls._FADE_BREAK_DB) * cls._FADE_BOOST
+
+    @classmethod
+    def _weighted_to_db(cls, w):
+        if w <= cls._FADE_BREAK_DB:
+            return w
+        return cls._FADE_BREAK_DB + (w - cls._FADE_BREAK_DB) / cls._FADE_BOOST
+
     def _unified_step(self):
         """Single timer callback -- steps ALL active fades in the same tick.
-        Interpolates linearly in dB space for visually smooth fader movement.
+
+        Interpolates linearly in a WEIGHTED dB space, not raw dB: ticks are
+        spent proportionally more on the -30..0dB range (see _FADE_BOOST)
+        than on the -144..-30 range, since the latter is mostly inaudible
+        anyway. This gives smoother, finer motion where it's actually
+        noticed, without needing more total steps.
+
+        (Linear-in-gain was tried and rejected: for a fade starting at -inf,
+        gain is ~0 at the start, so even a small linear step in gain space
+        corresponds to a huge dB swing -- e.g. the very first tick jumps
+        straight to around -30dB, no matter how many steps are used. Plain
+        linear-in-dB has no such discontinuity, so the weighting above is
+        applied on top of that instead of switching to gain space.)
 
         All of this tick's values are sent as ONE BATCH_SET instead of one
         individual SET per fading parameter. With many parameters fading at
         once (e.g. every fader + every send set to fade together), sending
-        one SET per parameter per 50ms tick means hundreds of individual
-        writes per second for the whole fade -- easily overwhelming Wing's
+        one SET per parameter per tick (25ms at the default 40fps) means
+        hundreds of individual writes per second for the whole fade -- easily overwhelming Wing's
         receive pipeline and causing dropped/reordered updates (seen as
         values jumping around or not landing on the right value). A single
         combined BATCH_SET per tick cuts that by roughly the number of
@@ -1603,13 +1651,17 @@ class WingOSC(QObject):
         batch = []   # (path, value) pairs to send this tick
         for job in self._fade_jobs:
             path, start_db, end_db, steps, n = job
-            t      = n / (steps - 1) if steps > 1 else 1.0
-            db_now = start_db + (end_db - start_db) * t
+            t = n / (steps - 1) if steps > 1 else 1.0
+            if t >= 1.0:
+                db_now = end_db   # exact target, no round-trip through weighting
+            else:
+                w_start = self._db_to_weighted(start_db)
+                w_end   = self._db_to_weighted(end_db)
+                w_now   = w_start + (w_end - w_start) * t
+                db_now  = self._weighted_to_db(w_now)
             batch.append((path, db_now))
             job[4] = n + 1
             if n + 1 >= steps:
-                # db_now already equals end_db here (t == 1.0) -- no need to
-                # send it a second time.
                 done.append(job)
 
         if batch:
