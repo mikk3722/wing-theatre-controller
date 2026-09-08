@@ -4,7 +4,7 @@ Professional show-control software for Behringer Wing mixer.
 DiGiCo-inspired: snapshots/cues, GO, Auto Update, Recall Scope, Fades, OSC/TCP control.
 
 ## Developers
-- **Mikkel Peter Larsen** - wing-theatre-controller@mikkelpeterlarsen.dk
+- **Mikkel Peter Larsen**
 - **Claude** (Anthropic — claude.ai)
 
 ## Credits
@@ -21,7 +21,9 @@ MIT
 See [Releases](../../releases) for pre-built binaries for macOS and Windows.
 
 ## User Manual
-📖 [Wing Theatre Controller Manual](./Wing-Theatre-Controller-Manual.docx) — full guide for sound engineers: installation, connecting to the Wing, cue lists, Recall Scope, fades, Auto Update, and OSC/Companion remote control.
+📖 [Wing Theatre Controller Manual (PDF — click to read in browser)](./Wing-Theatre-Controller-Manual.pdf) · [Word version (.docx)](./Wing-Theatre-Controller-Manual.docx)
+
+Full guide for sound engineers: installation, connecting to the Wing, cue lists, Recall Scope, fades, Auto Update, and OSC/Companion remote control (including installing the Companion module itself).
 
 ## Structure
 ```
