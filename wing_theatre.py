@@ -21,6 +21,7 @@ def _copy_channel_scopes(src):
         new_cs.overrides  = dict(cs.overrides)
         new_cs.fader_fade = float(cs.fader_fade)
         new_cs.sends_fade = float(cs.sends_fade)
+        new_cs.send_overrides = dict(getattr(cs, 'send_overrides', {}))
         result[k] = new_cs
     return result
 from PyQt6.QtWidgets import (
@@ -367,11 +368,17 @@ class ChannelScope:
         self.overrides   = {}    # scope_key -> bool
         self.fader_fade  = 0.0   # seconds (0 = use group default)
         self.sends_fade  = 0.0   # seconds (0 = use group default)
+        # Per-bus send overrides: bus_num (1-16) -> bool. Only set when the
+        # user has explicitly customised an individual send in the expanded
+        # Sends columns. Absent = fall back to the aggregate 'sends' entry
+        # in `overrides` (unchanged existing behaviour).
+        self.send_overrides = {}
 
     def to_dict(self):
         return {"overrides": self.overrides,
                 "fader_fade": self.fader_fade,
-                "sends_fade": self.sends_fade}
+                "sends_fade": self.sends_fade,
+                "send_overrides": self.send_overrides}
 
     @staticmethod
     def from_dict(d):
@@ -381,6 +388,11 @@ class ChannelScope:
             cs.overrides   = d.get("overrides", {})
             cs.fader_fade  = d.get("fader_fade", 0.0)
             cs.sends_fade  = d.get("sends_fade", 0.0)
+            # Old files won't have this key -- default to {} (no per-bus
+            # customisation), same as a brand new ChannelScope.
+            raw = d.get("send_overrides", {})
+            # JSON object keys are always strings; convert back to int bus numbers.
+            cs.send_overrides = {int(k): v for k, v in raw.items()}
         else:
             cs.overrides = d   # old format
         return cs
@@ -1501,7 +1513,22 @@ class WingOSC(QObject):
         if ch_key.startswith('fx_'):
             return snapshot.fx_scope.get(ch_key, True)
         cs = snapshot.get_ch_scope(ch_key)
+        if scope_key == 'sends':
+            bus = self._path_to_send_bus_key(path)
+            if bus is not None and bus in cs.send_overrides:
+                # Explicit per-bus override exists (set via the expanded
+                # Sends columns) -- use it instead of the aggregate toggle.
+                return cs.send_overrides[bus]
         return cs.overrides.get(scope_key, snapshot.scope.get(scope_key, True))
+
+    def _path_to_send_bus_key(self, path):
+        """Extract the bus number (1-16) from a /ch/N/send/M/... path.
+        Returns None if this isn't a channel send path at all."""
+        p = path.split('/')
+        if len(p) >= 5 and p[3] == 'send':
+            try:    return int(p[4])
+            except: return None
+        return None
 
     def _path_to_ch_key(self, path):
         p = path.split('/')
@@ -2261,9 +2288,10 @@ class DefaultScopeDialog(QDialog):
             DEFAULT_SCOPE.update(self._temp.scope)
 
             DEFAULT_CHANNEL_SCOPES.clear()
-            # Only save channel scopes with actual overrides or fade times
+            # Only save channel scopes with actual overrides, per-send
+            # customisation, or fade times
             non_empty = {k: v for k, v in self._temp.channel_scopes.items()
-                         if v.overrides or v.fader_fade > 0 or v.sends_fade > 0}
+                         if v.overrides or v.send_overrides or v.fader_fade > 0 or v.sends_fade > 0}
             DEFAULT_CHANNEL_SCOPES.update(_copy_channel_scopes(non_empty))
 
             DEFAULT_FX_SCOPE.clear()
@@ -2395,6 +2423,18 @@ FADE_F_COL  = 2    # Fader xFade -- first after expand button
 FADE_S_COL  = 3    # Sends xFade
 FIRST_SCOPE = 4    # Scope circle columns start here
 TOTAL_COLS  = FIRST_SCOPE + len(WING_SCOPE_COLS)
+
+# Per-bus send columns -- appended AFTER all existing scope columns so none
+# of their fixed indices change. Hidden by default; shown (and visually
+# moved next to the aggregate Sends column via header().moveSection()) only
+# when the user expands Sends. Only meaningful for input channels (channel
+# sends target buses 1-16) -- other row kinds show " --" same as DCAs do
+# for the aggregate Sends column today.
+SEND_BUS_COUNT  = 16
+SENDS_COL       = FIRST_SCOPE + next(
+    i for i, (sk, _, _) in enumerate(WING_SCOPE_COLS) if sk == 'sends')
+SEND_FIRST_COL  = TOTAL_COLS
+SEND_TOTAL_COLS = TOTAL_COLS + SEND_BUS_COUNT
 
 # Circle state stored in UserRole on scope columns (cols FIRST_SCOPE+).
 # Column 0 also uses UserRole for item metadata -- no conflict since different columns.
@@ -2556,7 +2596,7 @@ class RecallScopeWidget(QWidget):
         chan_layout.setContentsMargins(0, 0, 0, 0)
         chan_layout.setSpacing(0)
 
-        total_cols = TOTAL_COLS
+        total_cols = SEND_TOTAL_COLS
         self.tree = QTreeWidget()
         self.tree.setColumnCount(total_cols)
         self.tree.setAlternatingRowColors(True)
@@ -2569,8 +2609,11 @@ class RecallScopeWidget(QWidget):
             QAbstractItemView.EditTrigger.DoubleClicked |
             QAbstractItemView.EditTrigger.EditKeyPressed)
 
-        headers = ["Path", "▶", "Fdr xFade", "Snd xFade"] + [short for _, short, _ in WING_SCOPE_COLS]
+        headers = (["Path", "▶", "Fdr xFade", "Snd xFade"]
+                   + [short for _, short, _ in WING_SCOPE_COLS]
+                   + [f"Bus{b}" for b in range(1, SEND_BUS_COUNT + 1)])
         self.tree.setHeaderLabels(headers)
+        self.tree.headerItem().setText(SENDS_COL, "▶ Sends")
         hdr = self.tree.header()
         hdr.setDefaultSectionSize(52)
         hdr.setMinimumSectionSize(40)
@@ -2584,13 +2627,27 @@ class RecallScopeWidget(QWidget):
         hdr.setSectionResizeMode(FADE_S_COL, QHeaderView.ResizeMode.Fixed)
         # Hide the expand column header label -- it's visual-only
         self.tree.headerItem().setText(EXPAND_COL, "")
-        for i in range(FIRST_SCOPE, TOTAL_COLS):
+        for i in range(FIRST_SCOPE, SEND_TOTAL_COLS):
             hdr.setSectionResizeMode(i, QHeaderView.ResizeMode.Fixed)
 
         for i, (_, short, tip) in enumerate(WING_SCOPE_COLS):
             self.tree.headerItem().setToolTip(FIRST_SCOPE + i, f"{short}: {tip}")
         self.tree.headerItem().setToolTip(FADE_F_COL, "Fader crossfade time (seconds). Double-click to edit.")
         self.tree.headerItem().setToolTip(FADE_S_COL, "Sends crossfade time (seconds). Double-click to edit.")
+        self.tree.headerItem().setToolTip(
+            SENDS_COL, "Click to expand: recall-safe each bus send individually,\ninstead of all-or-nothing for the whole channel.")
+
+        # Per-bus send columns start hidden and are visually placed right
+        # after the Sends column (between Sends and Fader) -- logical index
+        # never changes, only the on-screen order, so nothing that reads
+        # these columns by their fixed index is affected either way.
+        self._sends_expanded = False
+        for i, b in enumerate(range(1, SEND_BUS_COUNT + 1)):
+            col = SEND_FIRST_COL + i
+            hdr.resizeSection(col, 44)
+            self.tree.headerItem().setToolTip(col, f"Send level/mute to Bus {b} (input channels only)")
+            self.tree.setColumnHidden(col, True)
+            hdr.moveSection(hdr.visualIndex(col), SENDS_COL + 1 + i)
 
         self._delegate = ScopeCircleDelegate(self.tree)
         self.tree.setItemDelegate(self._delegate)
@@ -2742,6 +2799,34 @@ class RecallScopeWidget(QWidget):
             item.setData(col, CIRCLE_ROLE, circle)
             item.setBackground(col, QColor(C['bg3']))
 
+        # Per-bus send columns -- only the input-channels group has real
+        # per-send data; other groups (buses, matrix, DCAs) show " --",
+        # same as their existing non-applicable scope columns above.
+        is_inputs_group = (group_key == "inputs")
+        global_sends_val = global_scope.get('sends', True)
+        for b in range(1, SEND_BUS_COUNT + 1):
+            col = SEND_FIRST_COL + (b - 1)
+            if not is_inputs_group:
+                item.setText(col, " --")
+                item.setForeground(col, QColor(C['text3']))
+                item.setBackground(col, QColor(C['bg3']))
+                continue
+            vals = []
+            for ck in ch_keys:
+                cs = self.snapshot.channel_scopes.get(ck)
+                fallback = (cs.overrides.get('sends', global_sends_val) if cs else global_sends_val)
+                vals.append(cs.send_overrides.get(b, fallback) if cs else fallback)
+            if not vals:
+                circle = CIRCLE_ON if global_sends_val else CIRCLE_OFF
+            elif all(vals):
+                circle = CIRCLE_ON
+            elif any(vals):
+                circle = CIRCLE_PART
+            else:
+                circle = CIRCLE_OFF
+            item.setData(col, CIRCLE_ROLE, circle)
+            item.setBackground(col, QColor(C['bg3']))
+
         # Fade time columns -- group headers always show "0.0" (never blank)
         ff = self.snapshot.get_group_fade(group_key, "fader")
         fs = self.snapshot.get_group_fade(group_key, "sends")
@@ -2792,6 +2877,21 @@ class RecallScopeWidget(QWidget):
                 global_val = global_scope.get(sk, True)
                 val = (cs.overrides.get(sk, global_val) if cs else global_val)
                 item.setData(col, CIRCLE_ROLE, CIRCLE_ON if val else CIRCLE_OFF)
+
+        # Per-bus send columns -- only meaningful for input channels (channel
+        # sends target buses). Other row kinds (bus/mtx/main/dca) show " --",
+        # same visual treatment as an inapplicable scope column above.
+        is_input = ch_key.startswith("input_")
+        global_sends_val = global_scope.get('sends', True)
+        for b in range(1, SEND_BUS_COUNT + 1):
+            col = SEND_FIRST_COL + (b - 1)
+            if not is_input:
+                item.setText(col, " --")
+                item.setForeground(col, QColor(C['text3']))
+                continue
+            fallback = (cs.overrides.get('sends', global_sends_val) if cs else global_sends_val)
+            val = (cs.send_overrides.get(b, fallback) if cs else fallback)
+            item.setData(col, CIRCLE_ROLE, CIRCLE_ON if val else CIRCLE_OFF)
         return item
 
     def _update_expand_buttons(self):
@@ -2810,6 +2910,10 @@ class RecallScopeWidget(QWidget):
         if col == EXPAND_COL and data["type"] == "group":
             item.setExpanded(not item.isExpanded())
             self._update_expand_buttons()
+            return
+
+        if SEND_FIRST_COL <= col < SEND_TOTAL_COLS:
+            self._on_send_cell_clicked(item, col, data)
             return
 
         if col < FIRST_SCOPE or col >= TOTAL_COLS or not self.snapshot:
@@ -2858,7 +2962,66 @@ class RecallScopeWidget(QWidget):
         self.tree.viewport().update()
         self.scope_changed.emit()
 
-    def _on_fade_edited(self, item, col):
+    def _on_send_cell_clicked(self, item, col, data):
+        """Click a single bus cell in the expanded Sends columns -- same
+        on/off toggle behaviour as the regular scope columns, scoped to
+        send_overrides[bus] instead of overrides[sk]. Only input channels
+        have real data here (others show ' --' and are not clickable)."""
+        if not self.snapshot:
+            return
+        bus = col - SEND_FIRST_COL + 1
+        global_val = self.snapshot.scope.get('sends', True)
+
+        if data["type"] == "group":
+            if data.get("key") != "inputs":
+                return   # " --" cells (buses/matrix/DCA groups) aren't interactive
+            current  = item.data(col, CIRCLE_ROLE)
+            new_val  = (current != CIRCLE_ON)
+            new_circ = CIRCLE_ON if new_val else CIRCLE_OFF
+            for ck in data.get("children", []):
+                cs = self.snapshot.get_ch_scope(ck)
+                cs.send_overrides[bus] = new_val
+            item.setData(col, CIRCLE_ROLE, new_circ)
+            for i in range(item.childCount()):
+                item.child(i).setData(col, CIRCLE_ROLE, new_circ)
+
+        elif data["type"] == "channel":
+            ck = data["key"]
+            if not ck.startswith("input_"):
+                return
+            cs      = self.snapshot.get_ch_scope(ck)
+            current = item.data(col, CIRCLE_ROLE)
+            new_val = (current != CIRCLE_ON)
+            cs.send_overrides[bus] = new_val
+            item.setData(col, CIRCLE_ROLE, CIRCLE_ON if new_val else CIRCLE_OFF)
+            self._refresh_send_group_col(item, col, bus)
+
+        self.tree.viewport().update()
+        self.scope_changed.emit()
+
+    def _refresh_send_group_col(self, child_item, col, bus):
+        """After a channel-level send toggle, recompute the parent group's
+        aggregate circle for that same bus column."""
+        parent = child_item.parent()
+        if not parent:
+            return
+        data = parent.data(LABEL_COL, Qt.ItemDataRole.UserRole)
+        if not data or data.get("key") != "inputs":
+            return
+        global_val = self.snapshot.scope.get('sends', True)
+        vals = []
+        for ck in data.get("children", []):
+            cs = self.snapshot.channel_scopes.get(ck)
+            fallback = (cs.overrides.get('sends', global_val) if cs else global_val)
+            vals.append(cs.send_overrides.get(bus, fallback) if cs else fallback)
+        if not vals:
+            return
+        if all(vals):   circle = CIRCLE_ON
+        elif any(vals): circle = CIRCLE_PART
+        else:           circle = CIRCLE_OFF
+        parent.setData(col, CIRCLE_ROLE, circle)
+
+
         """Handle edits to the Fader/Sends fade time columns."""
         if col not in (FADE_F_COL, FADE_S_COL) or not self.snapshot:
             return
@@ -2912,6 +3075,12 @@ class RecallScopeWidget(QWidget):
     # ── Header column click -- toggle entire column ────────────────────────────
 
     def _on_header_clicked(self, col):
+        if col == SENDS_COL:
+            self._toggle_sends_expanded()
+            return
+        if SEND_FIRST_COL <= col < SEND_TOTAL_COLS:
+            self._on_send_header_clicked(col)
+            return
         if col < FIRST_SCOPE or col >= TOTAL_COLS or not self.snapshot:
             return
         sk = WING_SCOPE_COLS[col - FIRST_SCOPE][0]
@@ -2928,7 +3097,53 @@ class RecallScopeWidget(QWidget):
         self.tree.viewport().update()
         self.scope_changed.emit()
 
-    # ── Bulk actions ──────────────────────────────────────────────────────────
+    def _toggle_sends_expanded(self):
+        """Show/hide the per-bus send columns, positioned right after the
+        aggregate Sends column. Logical column indices never change -- only
+        visibility and on-screen order -- so this never touches how any
+        other column's data is read or written."""
+        self._sends_expanded = not self._sends_expanded
+        for i in range(SEND_BUS_COUNT):
+            self.tree.setColumnHidden(SEND_FIRST_COL + i, not self._sends_expanded)
+        self.tree.headerItem().setText(
+            SENDS_COL, ("▼ Sends" if self._sends_expanded else "▶ Sends"))
+
+    def _on_send_header_clicked(self, col):
+        """Click a per-bus send sub-header -- toggle that one bus on/off
+        for every input channel at once (same pattern as _on_header_clicked,
+        scoped to send_overrides instead of the aggregate overrides dict)."""
+        if not self.snapshot:
+            return
+        bus = col - SEND_FIRST_COL + 1
+        # Determine current aggregate state across all input channels to
+        # decide on vs off, same "any on -> turn all off, else all on" logic
+        # used for the regular scope-key column headers.
+        global_val = self.snapshot.scope.get('sends', True)
+        any_on = False
+        for i in range(self.tree.topLevelItemCount()):
+            grp = self.tree.topLevelItem(i)
+            for j in range(grp.childCount()):
+                child = grp.child(j)
+                d = child.data(LABEL_COL, Qt.ItemDataRole.UserRole)
+                ck = d.get("key", "") if d else ""
+                if not ck.startswith("input_"):
+                    continue
+                cs = self.snapshot.channel_scopes.get(ck)
+                val = (cs.send_overrides.get(bus, cs.overrides.get('sends', global_val))
+                       if cs else global_val)
+                if val:
+                    any_on = True
+                    break
+            if any_on:
+                break
+        new_val = not any_on
+        for ch_key, cs in self.snapshot.channel_scopes.items():
+            if ch_key.startswith("input_"):
+                cs.send_overrides[bus] = new_val
+        self._rebuild(restore_expansion=True)
+        self.scope_changed.emit()
+
+
 
     def _global_all(self, value):
         try:
@@ -2956,6 +3171,7 @@ class RecallScopeWidget(QWidget):
             self.snapshot.scope[k] = value
         for cs in self.snapshot.channel_scopes.values():
             cs.overrides.clear()
+            cs.send_overrides.clear()
         self._rebuild(restore_expansion=True)
         self.scope_changed.emit()
 
