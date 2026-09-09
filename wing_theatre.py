@@ -1074,6 +1074,16 @@ class WingOSC(QObject):
         import re
         prop_re = re.compile(r"^prop(\d+) = (.+)$")
         current_ctx = {}
+        # Diagnostic: track (section, model) combos we've already warned
+        # about, so a propmap lookup miss for an unrecognised model (e.g.
+        # a model name mismatch between propmap.jsonl and what Wing
+        # actually sends) gets logged once, not spammed for every propN.
+        _prop_miss_warned = set()
+        # Diagnostic: log each distinct model name the first time it's seen
+        # (not per-channel -- that would be 48+ messages on every connect),
+        # so the exact string Wing uses (e.g. for "Dual Dynamic EQ") is
+        # visible even if we've never seen it selected before.
+        _seen_model_names = set()
         try:
             for line in self._wingmon_proc.stdout:
                 if not getattr(self, '_wingmon_running', False):
@@ -1120,7 +1130,6 @@ class WingOSC(QObject):
                                     path = f"{ch_path}/{model}/{param}"
                                 else:
                                     path = f"{ch_path}/{section}/{model}/{param}"
-                                path = path
                                 try:
                                     value = self._parse_wing_val(path, val_str)
                                 except ValueError:
@@ -1131,6 +1140,12 @@ class WingOSC(QObject):
                                     self._au_baseline[path] = value
                                 with self._wing_state_lock:
                                     self._wing_state[path] = value
+                            elif (section, model) not in _prop_miss_warned:
+                                _prop_miss_warned.add((section, model))
+                                self.log_message.emit(
+                                    f"propmap: no entry for section='{section}' "
+                                    f"model='{model}' (prop{idx}) -- this model's "
+                                    f"parameters won't be captured/recalled")
                         continue
 
                     if " = " not in rest:
@@ -1144,8 +1159,13 @@ class WingOSC(QObject):
                     parts = path.split('/')
                     if path.endswith('/mdl') and len(parts) >= 5 and parts[3] in ('eq','gate','dyn','flt'):
                         ch_path = '/' + '/'.join(parts[1:3])
-                        current_ctx[parts[3]] = (ch_path, val_str.strip())
-                        self._dyn_models[(ch_path, parts[3])] = val_str.strip()
+                        mdl_name = val_str.strip()
+                        current_ctx[parts[3]] = (ch_path, mdl_name)
+                        self._dyn_models[(ch_path, parts[3])] = mdl_name
+                        if (parts[3], mdl_name) not in _seen_model_names:
+                            _seen_model_names.add((parts[3], mdl_name))
+                            self.log_message.emit(
+                                f"Model seen: {parts[3]} = '{mdl_name}'")
                     elif path.endswith('/mdl') and len(parts) >= 4 and parts[1] == 'fx':
                         current_ctx['fx'] = ('/fx/' + parts[2], val_str.strip())
                     elif len(parts) >= 5 and parts[3] in ('eq','gate','dyn','flt'):
@@ -1186,6 +1206,12 @@ class WingOSC(QObject):
                             except ValueError:
                                 value = val_str
                             self._emit_wing_event(path, value)
+                        elif (section, model) not in _prop_miss_warned:
+                            _prop_miss_warned.add((section, model))
+                            self.log_message.emit(
+                                f"propmap: no entry for section='{section}' "
+                                f"model='{model}' (prop{idx}) -- this model's "
+                                f"parameters won't be captured/recalled")
                     continue
 
                 if '=' not in line:
@@ -1204,8 +1230,13 @@ class WingOSC(QObject):
                         if len(parts) >= 5 and parts[3] in ('eq','gate','dyn','flt'):
                             ch_path = '/' + '/'.join(parts[1:3])
                             section = parts[3]
-                            current_ctx[section] = (ch_path, val_str.strip())
-                            self._dyn_models[(ch_path, section)] = val_str.strip()
+                            mdl_name = val_str.strip()
+                            current_ctx[section] = (ch_path, mdl_name)
+                            self._dyn_models[(ch_path, section)] = mdl_name
+                            if (section, mdl_name) not in _seen_model_names:
+                                _seen_model_names.add((section, mdl_name))
+                                self.log_message.emit(
+                                    f"Model seen: {section} = '{mdl_name}'")
                         elif len(parts) >= 4 and parts[1] == 'fx':
                             current_ctx['fx'] = ('/fx/' + parts[2], val_str.strip())
                         self._emit_wing_event(path, val_str.strip())
@@ -1469,7 +1500,12 @@ class WingOSC(QObject):
             import time
 
             def order_key(pv):
-                """mode/link before dependent params within sends and delay."""
+                """mode/link before dependent params within sends and delay.
+                Model select (/mdl) before its own model's parameters within
+                eq/gate/dyn/flt -- otherwise a model-specific value (e.g. a
+                Dual Dynamic EQ threshold) can be sent while Wing is still on
+                the PREVIOUS model and gets silently ignored, then the model
+                switch arrives after, too late to matter."""
                 path = pv[0]
                 if '/send/' in path:
                     if path.endswith('/mode'):  return (0, path)
@@ -1481,6 +1517,10 @@ class WingOSC(QObject):
                     return (0, path)
                 if 'dlyon' in path or path.endswith('/dly/on'):
                     return (9, path)
+                if path.endswith('/mdl'):
+                    parts = path.split('/')
+                    if len(parts) >= 4 and parts[3] in ('eq', 'gate', 'dyn', 'flt'):
+                        return (0, path)
                 return (5, path)
 
             # Mutes/faders first, then rest sorted by dependency order
