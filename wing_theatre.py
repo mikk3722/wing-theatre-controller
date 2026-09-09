@@ -389,10 +389,11 @@ class ChannelScope:
             cs.fader_fade  = d.get("fader_fade", 0.0)
             cs.sends_fade  = d.get("sends_fade", 0.0)
             # Old files won't have this key -- default to {} (no per-bus
-            # customisation), same as a brand new ChannelScope.
-            raw = d.get("send_overrides", {})
-            # JSON object keys are always strings; convert back to int bus numbers.
-            cs.send_overrides = {int(k): v for k, v in raw.items()}
+            # customisation), same as a brand new ChannelScope. Keys are
+            # raw strings matching Wing's own send-destination naming
+            # ("1".."16" for buses, "MX1".."MX8" for matrix) -- JSON object
+            # keys are already strings, so no conversion needed.
+            cs.send_overrides = d.get("send_overrides", {})
         else:
             cs.overrides = d   # old format
         return cs
@@ -1036,8 +1037,11 @@ class WingOSC(QObject):
         """Parse a Wing parameter value.
 
         Uses propmap type info so that float params (EQ gain, dyn threshold etc.)
-        are always stored as float even when Wing sends whole-number values like 0 or 1.
-        Without this, set_int(0) for EQ gain would set step 0 (≈ -12 dB) not 0 dB.
+        are always stored as float even when Wing sends whole-number values.
+        Without this, set_int(0) for EQ gain would set step 0 (≈ -12 dB) not 0 dB
+        -- and the same misclassification can happen for ANY whole-number
+        value, not just 0/1 (e.g. a Dual Dynamic EQ threshold or gain that
+        happens to land on an integer dB value like -2 or 5).
         """
         val_str = val_str.strip()
         if '.' in val_str:
@@ -1045,16 +1049,16 @@ class WingOSC(QObject):
             except: return val_str
         try:
             iv = int(val_str)
-            # Values outside [0,1] are unambiguously float for float params
-            if not (0 <= iv <= 1):
-                return float(iv)
-            # For 0 and 1: check propmap type.
-            # If this path is a known float-type param, store as float
-            # so wingmon uses set_float (actual value) not set_int (step number).
+            # Check propmap type for EVERY whole-number value, not just 0/1.
+            # A value outside [0,1] is NOT unambiguously float -- Wing has
+            # genuine integer enum/selector params (band select, detector
+            # mode, filter type etc.) whose values can be 2, 3, 4... and
+            # those must stay int, or wingmon sends set_float for a
+            # parameter Wing expects as set_int.
             float_paths = getattr(self, '_float_paths', set())
             if path in float_paths:
                 return float(iv)
-            return iv   # boolean param (on/off, mute, inv etc.)
+            return iv   # int param (boolean, enum/selector, etc.)
         except ValueError:
             return val_str
 
@@ -1222,12 +1226,12 @@ class WingOSC(QObject):
                             value = float(val_str)
                         else:
                             iv = int(val_str)
-                            # Use propmap type info: float params at 0 or 1
-                            # must be set_float not set_int (step number)
-                            value = iv if 0 <= iv <= 1 else float(iv)
+                            # Check propmap type for EVERY whole-number
+                            # value, not just 0/1 -- values outside [0,1]
+                            # are NOT unambiguously float (genuine integer
+                            # enum/selector params exist too).
                             float_paths = getattr(self, '_float_paths', set())
-                            if isinstance(value, int) and path in float_paths:
-                                value = float(value)
+                            value = float(iv) if path in float_paths else iv
                     except ValueError:
                         value = val_str
                     self._emit_wing_event(path, value)
@@ -1515,20 +1519,23 @@ class WingOSC(QObject):
             return snapshot.fx_scope.get(ch_key, True)
         cs = snapshot.get_ch_scope(ch_key)
         if scope_key == 'sends':
-            bus = self._path_to_send_bus_key(path)
+            bus = self._path_to_send_dest_key(path)
             if bus is not None and bus in cs.send_overrides:
                 # Explicit per-bus override exists (set via the expanded
                 # Sends columns) -- use it instead of the aggregate toggle.
                 return cs.send_overrides[bus]
         return cs.overrides.get(scope_key, snapshot.scope.get(scope_key, True))
 
-    def _path_to_send_bus_key(self, path):
-        """Extract the bus number (1-16) from a /ch/N/send/M/... path.
-        Returns None if this isn't a channel send path at all."""
+    def _path_to_send_dest_key(self, path):
+        """Extract the send destination key from a /ch/N/send/D/... or
+        /bus/N/send/D/... path. D is the raw string Wing uses -- a plain
+        number for a bus destination ("1".."16"), or "MX1".."MX8" for a
+        matrix destination (confirmed from a live event: a channel send to
+        matrix arrives as /ch/N/send/MX1/lvl, not a numeric continuation).
+        Returns None if this isn't a send path at all."""
         p = path.split('/')
         if len(p) >= 5 and p[3] == 'send':
-            try:    return int(p[4])
-            except: return None
+            return p[4]
         return None
 
     def _path_to_ch_key(self, path):
@@ -2431,11 +2438,24 @@ TOTAL_COLS  = FIRST_SCOPE + len(WING_SCOPE_COLS)
 # when the user expands Sends. Only meaningful for input channels (channel
 # sends target buses 1-16) -- other row kinds show " --" same as DCAs do
 # for the aggregate Sends column today.
+# Per-bus/matrix send columns -- appended AFTER all existing scope columns
+# so none of their fixed indices change. Hidden by default; shown (and
+# visually moved next to the aggregate Sends column via header().moveSection())
+# only when the user expands Sends. Meaningful for input channels AND buses
+# -- both send to buses (channel->bus, bus->bus), and both send directly to
+# matrix outputs too (confirmed live: channel sends to matrix arrive as
+# /ch/N/send/MX1/lvl, not routed via a bus). Other row kinds show " --" same
+# as DCAs do for the aggregate Sends column today.
 SEND_BUS_COUNT  = 16
+SEND_MTX_COUNT  = 8
+# Destination key for each column, in the exact string form Wing itself
+# uses on the wire -- "1".."16" for bus sends, "MX1".."MX8" for matrix sends.
+SEND_DEST_KEYS  = [str(b) for b in range(1, SEND_BUS_COUNT + 1)] \
+                 + [f"MX{m}" for m in range(1, SEND_MTX_COUNT + 1)]
 SENDS_COL       = FIRST_SCOPE + next(
     i for i, (sk, _, _) in enumerate(WING_SCOPE_COLS) if sk == 'sends')
 SEND_FIRST_COL  = TOTAL_COLS
-SEND_TOTAL_COLS = TOTAL_COLS + SEND_BUS_COUNT
+SEND_TOTAL_COLS = TOTAL_COLS + len(SEND_DEST_KEYS)
 
 # Circle state stored in UserRole on scope columns (cols FIRST_SCOPE+).
 # Column 0 also uses UserRole for item metadata -- no conflict since different columns.
@@ -2612,7 +2632,8 @@ class RecallScopeWidget(QWidget):
 
         headers = (["Path", "▶", "Fdr xFade", "Snd xFade"]
                    + [short for _, short, _ in WING_SCOPE_COLS]
-                   + [f"Bus{b}" for b in range(1, SEND_BUS_COUNT + 1)])
+                   + [f"Bus{b}" for b in range(1, SEND_BUS_COUNT + 1)]
+                   + [f"Mtx{m}" for m in range(1, SEND_MTX_COUNT + 1)])
         self.tree.setHeaderLabels(headers)
         self.tree.headerItem().setText(SENDS_COL, "▶ Sends")
         _sends_hdr_font = QFont(); _sends_hdr_font.setBold(True)
@@ -2638,17 +2659,18 @@ class RecallScopeWidget(QWidget):
         self.tree.headerItem().setToolTip(FADE_F_COL, "Fader crossfade time (seconds). Double-click to edit.")
         self.tree.headerItem().setToolTip(FADE_S_COL, "Sends crossfade time (seconds). Double-click to edit.")
         self.tree.headerItem().setToolTip(
-            SENDS_COL, "Click to expand: recall-safe each bus send individually,\ninstead of all-or-nothing for the whole channel.")
+            SENDS_COL, "Click to expand: recall-safe each bus/matrix send individually,\ninstead of all-or-nothing for the whole channel.")
 
-        # Per-bus send columns start hidden and are visually placed right
-        # after the Sends column (between Sends and Fader) -- logical index
-        # never changes, only the on-screen order, so nothing that reads
-        # these columns by their fixed index is affected either way.
+        # Per-destination send columns start hidden and are visually placed
+        # right after the Sends column (between Sends and Fader) -- logical
+        # index never changes, only the on-screen order, so nothing that
+        # reads these columns by their fixed index is affected either way.
         self._sends_expanded = False
-        for i, b in enumerate(range(1, SEND_BUS_COUNT + 1)):
+        for i, dest in enumerate(SEND_DEST_KEYS):
             col = SEND_FIRST_COL + i
             hdr.resizeSection(col, 44)
-            self.tree.headerItem().setToolTip(col, f"Send level/mute to Bus {b} (input channels only)")
+            label = f"Bus {dest}" if dest.isdigit() else f"Matrix {dest[2:]}"
+            self.tree.headerItem().setToolTip(col, f"Send level/mute to {label} (input channels and buses only)")
             self.tree.setColumnHidden(col, True)
             hdr.moveSection(hdr.visualIndex(col), SENDS_COL + 1 + i)
 
@@ -2802,14 +2824,14 @@ class RecallScopeWidget(QWidget):
             item.setData(col, CIRCLE_ROLE, circle)
             item.setBackground(col, QColor(C['bg3']))
 
-        # Per-bus send columns -- both the input-channels group and the
-        # buses group have real per-send data (channels send to buses, and
-        # buses can send to other buses). Other groups (matrix, mains,
-        # DCAs) show " --", same as their existing non-applicable columns.
+        # Per-destination send columns -- both the input-channels group and
+        # the buses group have real per-send data (channels/buses send to
+        # buses AND directly to matrix outputs). Other groups (matrix,
+        # mains, DCAs) show " --", same as their existing non-applicable columns.
         is_inputs_or_buses_group = group_key in ("inputs", "buses")
         global_sends_val = global_scope.get('sends', True)
-        for b in range(1, SEND_BUS_COUNT + 1):
-            col = SEND_FIRST_COL + (b - 1)
+        for i, dest in enumerate(SEND_DEST_KEYS):
+            col = SEND_FIRST_COL + i
             if not is_inputs_or_buses_group:
                 item.setText(col, " --")
                 item.setForeground(col, QColor(C['text3']))
@@ -2819,7 +2841,7 @@ class RecallScopeWidget(QWidget):
             for ck in ch_keys:
                 cs = self.snapshot.channel_scopes.get(ck)
                 fallback = (cs.overrides.get('sends', global_sends_val) if cs else global_sends_val)
-                vals.append(cs.send_overrides.get(b, fallback) if cs else fallback)
+                vals.append(cs.send_overrides.get(dest, fallback) if cs else fallback)
             if not vals:
                 circle = CIRCLE_ON if global_sends_val else CIRCLE_OFF
             elif all(vals):
@@ -2882,20 +2904,21 @@ class RecallScopeWidget(QWidget):
                 val = (cs.overrides.get(sk, global_val) if cs else global_val)
                 item.setData(col, CIRCLE_ROLE, CIRCLE_ON if val else CIRCLE_OFF)
 
-        # Per-bus send columns -- input channels send to buses, and buses
-        # can themselves send to other buses, so both row kinds get real
-        # data here. Other row kinds (mtx/main/dca) show " --".
+        # Per-destination send columns -- input channels send to buses AND
+        # directly to matrix outputs; buses can send to other buses and to
+        # matrix outputs too. Both row kinds get real data here. Other row
+        # kinds (matrix/main/dca rows themselves) show " --".
         is_input = ch_key.startswith("input_")
         is_bus   = ch_key.startswith("bus_")
         global_sends_val = global_scope.get('sends', True)
-        for b in range(1, SEND_BUS_COUNT + 1):
-            col = SEND_FIRST_COL + (b - 1)
+        for i, dest in enumerate(SEND_DEST_KEYS):
+            col = SEND_FIRST_COL + i
             if not (is_input or is_bus):
                 item.setText(col, " --")
                 item.setForeground(col, QColor(C['text3']))
                 continue
             fallback = (cs.overrides.get('sends', global_sends_val) if cs else global_sends_val)
-            val = (cs.send_overrides.get(b, fallback) if cs else fallback)
+            val = (cs.send_overrides.get(dest, fallback) if cs else fallback)
             item.setData(col, CIRCLE_ROLE, CIRCLE_ON if val else CIRCLE_OFF)
         return item
 
@@ -2968,15 +2991,15 @@ class RecallScopeWidget(QWidget):
         self.scope_changed.emit()
 
     def _on_send_cell_clicked(self, item, col, data):
-        """Click a single bus cell in the expanded Sends columns -- same
-        on/off toggle behaviour as the regular scope columns, scoped to
-        send_overrides[bus] instead of overrides[sk]. Input channels and
-        buses both have real data here (channels send to buses; buses can
-        send to other buses too) -- other row kinds show ' --' and are
-        not clickable."""
+        """Click a single bus/matrix cell in the expanded Sends columns --
+        same on/off toggle behaviour as the regular scope columns, scoped
+        to send_overrides[dest] instead of overrides[sk]. Input channels
+        and buses both have real data here (channels/buses send to buses
+        AND directly to matrix outputs) -- other row kinds show ' --' and
+        are not clickable."""
         if not self.snapshot:
             return
-        bus = col - SEND_FIRST_COL + 1
+        dest = SEND_DEST_KEYS[col - SEND_FIRST_COL]
         global_val = self.snapshot.scope.get('sends', True)
 
         if data["type"] == "group":
@@ -2987,7 +3010,7 @@ class RecallScopeWidget(QWidget):
             new_circ = CIRCLE_ON if new_val else CIRCLE_OFF
             for ck in data.get("children", []):
                 cs = self.snapshot.get_ch_scope(ck)
-                cs.send_overrides[bus] = new_val
+                cs.send_overrides[dest] = new_val
             item.setData(col, CIRCLE_ROLE, new_circ)
             for i in range(item.childCount()):
                 item.child(i).setData(col, CIRCLE_ROLE, new_circ)
@@ -2999,16 +3022,16 @@ class RecallScopeWidget(QWidget):
             cs      = self.snapshot.get_ch_scope(ck)
             current = item.data(col, CIRCLE_ROLE)
             new_val = (current != CIRCLE_ON)
-            cs.send_overrides[bus] = new_val
+            cs.send_overrides[dest] = new_val
             item.setData(col, CIRCLE_ROLE, CIRCLE_ON if new_val else CIRCLE_OFF)
-            self._refresh_send_group_col(item, col, bus)
+            self._refresh_send_group_col(item, col, dest)
 
         self.tree.viewport().update()
         self.scope_changed.emit()
 
-    def _refresh_send_group_col(self, child_item, col, bus):
+    def _refresh_send_group_col(self, child_item, col, dest):
         """After a channel-level send toggle, recompute the parent group's
-        aggregate circle for that same bus column."""
+        aggregate circle for that same destination column."""
         parent = child_item.parent()
         if not parent:
             return
@@ -3020,7 +3043,7 @@ class RecallScopeWidget(QWidget):
         for ck in data.get("children", []):
             cs = self.snapshot.channel_scopes.get(ck)
             fallback = (cs.overrides.get('sends', global_val) if cs else global_val)
-            vals.append(cs.send_overrides.get(bus, fallback) if cs else fallback)
+            vals.append(cs.send_overrides.get(dest, fallback) if cs else fallback)
         if not vals:
             return
         if all(vals):   circle = CIRCLE_ON
@@ -3110,7 +3133,7 @@ class RecallScopeWidget(QWidget):
         visibility and on-screen order -- so this never touches how any
         other column's data is read or written."""
         self._sends_expanded = not self._sends_expanded
-        for i in range(SEND_BUS_COUNT):
+        for i in range(len(SEND_DEST_KEYS)):
             self.tree.setColumnHidden(SEND_FIRST_COL + i, not self._sends_expanded)
         self.tree.headerItem().setText(
             SENDS_COL, ("▼ Sends" if self._sends_expanded else "▶ Sends"))
@@ -3118,13 +3141,13 @@ class RecallScopeWidget(QWidget):
         self.tree.headerItem().setFont(SENDS_COL, _f)
 
     def _on_send_header_clicked(self, col):
-        """Click a per-bus send sub-header -- toggle that one bus on/off
-        for every input channel AND bus at once (same pattern as
-        _on_header_clicked, scoped to send_overrides instead of the
-        aggregate overrides dict)."""
+        """Click a per-destination send sub-header -- toggle that one
+        bus/matrix destination on/off for every input channel AND bus at
+        once (same pattern as _on_header_clicked, scoped to send_overrides
+        instead of the aggregate overrides dict)."""
         if not self.snapshot:
             return
-        bus = col - SEND_FIRST_COL + 1
+        dest = SEND_DEST_KEYS[col - SEND_FIRST_COL]
         # Determine current aggregate state to decide on vs off, same
         # "any on -> turn all off, else all on" logic used for the regular
         # scope-key column headers.
@@ -3139,7 +3162,7 @@ class RecallScopeWidget(QWidget):
                 if not (ck.startswith("input_") or ck.startswith("bus_")):
                     continue
                 cs = self.snapshot.channel_scopes.get(ck)
-                val = (cs.send_overrides.get(bus, cs.overrides.get('sends', global_val))
+                val = (cs.send_overrides.get(dest, cs.overrides.get('sends', global_val))
                        if cs else global_val)
                 if val:
                     any_on = True
@@ -3149,7 +3172,7 @@ class RecallScopeWidget(QWidget):
         new_val = not any_on
         for ch_key, cs in self.snapshot.channel_scopes.items():
             if ch_key.startswith("input_") or ch_key.startswith("bus_"):
-                cs.send_overrides[bus] = new_val
+                cs.send_overrides[dest] = new_val
         self._rebuild(restore_expansion=True)
         self.scope_changed.emit()
 
