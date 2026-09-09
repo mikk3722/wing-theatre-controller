@@ -1523,9 +1523,25 @@ class WingOSC(QObject):
                         return (0, path)
                 return (5, path)
 
-            # Mutes/faders first, then rest sorted by dependency order
-            priority  = sorted([(p,v) for p,v,pri in params if pri],     key=order_key)
-            secondary = sorted([(p,v) for p,v,pri in params if not pri], key=order_key)
+            def _is_model_select(path):
+                if not path.endswith('/mdl'):
+                    return False
+                parts = path.split('/')
+                return len(parts) >= 4 and parts[3] in ('eq', 'gate', 'dyn', 'flt')
+
+            # Mutes/faders first, then rest sorted by dependency order.
+            # Model-select (/mdl) paths are pulled into their own batch and
+            # sent with a real pause before anything else -- correct SEND
+            # ORDER alone isn't enough: switching an eq/dyn model is a real
+            # DSP-side operation on Wing that takes actual time, and with
+            # everything arriving in the same sub-millisecond burst, Wing
+            # can still be mid-switch when the model's own parameter values
+            # (e.g. Dual Dynamic EQ thresholds) arrive, and silently drops
+            # them. This was tested and confirmed: order fix alone was not
+            # sufficient, values still didn't land until this pause was added.
+            model_selects = sorted([(p,v) for p,v,pri in params if _is_model_select(p)], key=order_key)
+            priority  = sorted([(p,v) for p,v,pri in params if pri and not _is_model_select(p)],     key=order_key)
+            secondary = sorted([(p,v) for p,v,pri in params if not pri and not _is_model_select(p)], key=order_key)
 
             def send_batch(param_list, chunk_size=500, delay=0.002):
                 for i in range(0, len(param_list), chunk_size):
@@ -1536,7 +1552,12 @@ class WingOSC(QObject):
                     if i + chunk_size < len(param_list):
                         time.sleep(delay)
 
+            MODEL_SWITCH_SETTLE_SECS = 0.08
+
             try:
+                if model_selects:
+                    send_batch(model_selects)
+                    time.sleep(MODEL_SWITCH_SETTLE_SECS)
                 send_batch(priority)
                 send_batch(secondary)
                 for ms, path, val in delayed_cmds:
