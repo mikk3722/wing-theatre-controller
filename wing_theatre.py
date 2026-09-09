@@ -2615,6 +2615,8 @@ class RecallScopeWidget(QWidget):
                    + [f"Bus{b}" for b in range(1, SEND_BUS_COUNT + 1)])
         self.tree.setHeaderLabels(headers)
         self.tree.headerItem().setText(SENDS_COL, "▶ Sends")
+        _sends_hdr_font = QFont(); _sends_hdr_font.setBold(True)
+        self.tree.headerItem().setFont(SENDS_COL, _sends_hdr_font)
         hdr = self.tree.header()
         hdr.setDefaultSectionSize(52)
         hdr.setMinimumSectionSize(40)
@@ -2800,14 +2802,15 @@ class RecallScopeWidget(QWidget):
             item.setData(col, CIRCLE_ROLE, circle)
             item.setBackground(col, QColor(C['bg3']))
 
-        # Per-bus send columns -- only the input-channels group has real
-        # per-send data; other groups (buses, matrix, DCAs) show " --",
-        # same as their existing non-applicable scope columns above.
-        is_inputs_group = (group_key == "inputs")
+        # Per-bus send columns -- both the input-channels group and the
+        # buses group have real per-send data (channels send to buses, and
+        # buses can send to other buses). Other groups (matrix, mains,
+        # DCAs) show " --", same as their existing non-applicable columns.
+        is_inputs_or_buses_group = group_key in ("inputs", "buses")
         global_sends_val = global_scope.get('sends', True)
         for b in range(1, SEND_BUS_COUNT + 1):
             col = SEND_FIRST_COL + (b - 1)
-            if not is_inputs_group:
+            if not is_inputs_or_buses_group:
                 item.setText(col, " --")
                 item.setForeground(col, QColor(C['text3']))
                 item.setBackground(col, QColor(C['bg3']))
@@ -2879,14 +2882,15 @@ class RecallScopeWidget(QWidget):
                 val = (cs.overrides.get(sk, global_val) if cs else global_val)
                 item.setData(col, CIRCLE_ROLE, CIRCLE_ON if val else CIRCLE_OFF)
 
-        # Per-bus send columns -- only meaningful for input channels (channel
-        # sends target buses). Other row kinds (bus/mtx/main/dca) show " --",
-        # same visual treatment as an inapplicable scope column above.
+        # Per-bus send columns -- input channels send to buses, and buses
+        # can themselves send to other buses, so both row kinds get real
+        # data here. Other row kinds (mtx/main/dca) show " --".
         is_input = ch_key.startswith("input_")
+        is_bus   = ch_key.startswith("bus_")
         global_sends_val = global_scope.get('sends', True)
         for b in range(1, SEND_BUS_COUNT + 1):
             col = SEND_FIRST_COL + (b - 1)
-            if not is_input:
+            if not (is_input or is_bus):
                 item.setText(col, " --")
                 item.setForeground(col, QColor(C['text3']))
                 continue
@@ -2966,16 +2970,18 @@ class RecallScopeWidget(QWidget):
     def _on_send_cell_clicked(self, item, col, data):
         """Click a single bus cell in the expanded Sends columns -- same
         on/off toggle behaviour as the regular scope columns, scoped to
-        send_overrides[bus] instead of overrides[sk]. Only input channels
-        have real data here (others show ' --' and are not clickable)."""
+        send_overrides[bus] instead of overrides[sk]. Input channels and
+        buses both have real data here (channels send to buses; buses can
+        send to other buses too) -- other row kinds show ' --' and are
+        not clickable."""
         if not self.snapshot:
             return
         bus = col - SEND_FIRST_COL + 1
         global_val = self.snapshot.scope.get('sends', True)
 
         if data["type"] == "group":
-            if data.get("key") != "inputs":
-                return   # " --" cells (buses/matrix/DCA groups) aren't interactive
+            if data.get("key") not in ("inputs", "buses"):
+                return   # " --" cells (matrix/DCA groups) aren't interactive
             current  = item.data(col, CIRCLE_ROLE)
             new_val  = (current != CIRCLE_ON)
             new_circ = CIRCLE_ON if new_val else CIRCLE_OFF
@@ -2988,7 +2994,7 @@ class RecallScopeWidget(QWidget):
 
         elif data["type"] == "channel":
             ck = data["key"]
-            if not ck.startswith("input_"):
+            if not (ck.startswith("input_") or ck.startswith("bus_")):
                 return
             cs      = self.snapshot.get_ch_scope(ck)
             current = item.data(col, CIRCLE_ROLE)
@@ -3007,7 +3013,7 @@ class RecallScopeWidget(QWidget):
         if not parent:
             return
         data = parent.data(LABEL_COL, Qt.ItemDataRole.UserRole)
-        if not data or data.get("key") != "inputs":
+        if not data or data.get("key") not in ("inputs", "buses"):
             return
         global_val = self.snapshot.scope.get('sends', True)
         vals = []
@@ -3108,17 +3114,20 @@ class RecallScopeWidget(QWidget):
             self.tree.setColumnHidden(SEND_FIRST_COL + i, not self._sends_expanded)
         self.tree.headerItem().setText(
             SENDS_COL, ("▼ Sends" if self._sends_expanded else "▶ Sends"))
+        _f = QFont(); _f.setBold(True)
+        self.tree.headerItem().setFont(SENDS_COL, _f)
 
     def _on_send_header_clicked(self, col):
         """Click a per-bus send sub-header -- toggle that one bus on/off
-        for every input channel at once (same pattern as _on_header_clicked,
-        scoped to send_overrides instead of the aggregate overrides dict)."""
+        for every input channel AND bus at once (same pattern as
+        _on_header_clicked, scoped to send_overrides instead of the
+        aggregate overrides dict)."""
         if not self.snapshot:
             return
         bus = col - SEND_FIRST_COL + 1
-        # Determine current aggregate state across all input channels to
-        # decide on vs off, same "any on -> turn all off, else all on" logic
-        # used for the regular scope-key column headers.
+        # Determine current aggregate state to decide on vs off, same
+        # "any on -> turn all off, else all on" logic used for the regular
+        # scope-key column headers.
         global_val = self.snapshot.scope.get('sends', True)
         any_on = False
         for i in range(self.tree.topLevelItemCount()):
@@ -3127,7 +3136,7 @@ class RecallScopeWidget(QWidget):
                 child = grp.child(j)
                 d = child.data(LABEL_COL, Qt.ItemDataRole.UserRole)
                 ck = d.get("key", "") if d else ""
-                if not ck.startswith("input_"):
+                if not (ck.startswith("input_") or ck.startswith("bus_")):
                     continue
                 cs = self.snapshot.channel_scopes.get(ck)
                 val = (cs.send_overrides.get(bus, cs.overrides.get('sends', global_val))
@@ -3139,7 +3148,7 @@ class RecallScopeWidget(QWidget):
                 break
         new_val = not any_on
         for ch_key, cs in self.snapshot.channel_scopes.items():
-            if ch_key.startswith("input_"):
+            if ch_key.startswith("input_") or ch_key.startswith("bus_"):
                 cs.send_overrides[bus] = new_val
         self._rebuild(restore_expansion=True)
         self.scope_changed.emit()
