@@ -1338,13 +1338,14 @@ class WingOSC(QObject):
     def start_capture(self, duration_ms=12000):
         """
         Capture all Wing parameters.
-        Uses TCP GET via wingmon if available (fast, reliable).
-        Falls back to OSC UDP polling otherwise.
+        Uses TCP GET via wingmon (fast, reliable). There is no OSC-polling
+        fallback -- wingmon is required for capture.
         """
         if self._wingmon_running_ok():
             self._start_capture_tcp()
         else:
-            self._start_capture_osc(duration_ms)
+            self.log_message.emit(
+                "Capture unavailable -- wingmon is not running. Reconnect to Wing and try again.")
 
     def _start_capture_tcp(self):
         """Fast capture: send GET for each top-level node via wingmon TCP."""
@@ -3021,7 +3022,7 @@ class RecallScopeWidget(QWidget):
         else:           circle = CIRCLE_OFF
         parent.setData(col, CIRCLE_ROLE, circle)
 
-
+    def _on_fade_edited(self, item, col):
         """Handle edits to the Fader/Sends fade time columns."""
         if col not in (FADE_F_COL, FADE_S_COL) or not self.snapshot:
             return
