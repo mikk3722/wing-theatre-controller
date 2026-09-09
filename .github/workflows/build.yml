@@ -88,6 +88,18 @@ jobs:
             --hidden-import pythonosc \
             wing_theatre.py
 
+      - name: Sign app (ad-hoc)
+        run: |
+          # Ad-hoc signing (no Apple Developer account needed) -- required
+          # on Apple Silicon Macs for the app to launch at all. Without
+          # this, an unsigned .app can fail with "app is damaged and can't
+          # be opened" on M1/M2/M3 Macs instead of just the milder
+          # "unidentified developer" Gatekeeper prompt.
+          # --deep signs every nested binary/dylib inside the bundle, not
+          # just the top-level app wrapper.
+          codesign --force --deep --sign - "dist/Wing Theatre Controller.app"
+          codesign --verify --verbose "dist/Wing Theatre Controller.app"
+
       - name: Create DMG
         run: |
           hdiutil create \
