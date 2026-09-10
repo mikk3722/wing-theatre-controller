@@ -665,15 +665,22 @@ def _find_wingmon_path():
     """Find wingmon binary — works in dev, PyInstaller, Windows and macOS."""
     import sys, os, shutil
     exe_name = 'wingmon.exe' if sys.platform == 'win32' else 'wingmon'
+    # Older macOS builds bundled the binary under its build-artifact name
+    # ('wingmon-macos') instead of the plain name below -- checked as a
+    # fallback so already-downloaded older builds don't regress, though
+    # current builds bundle it correctly under 'wingmon' now.
+    alt_names = ['wingmon-macos'] if sys.platform == 'darwin' else []
     # 1. PyInstaller bundle
     if hasattr(sys, '_MEIPASS'):
-        p = os.path.join(sys._MEIPASS, exe_name)
-        if os.path.exists(p): return p
+        for name in [exe_name] + alt_names:
+            p = os.path.join(sys._MEIPASS, name)
+            if os.path.exists(p): return p
     # 2. Same folder as script/exe
     base = os.path.dirname(os.path.abspath(
         sys.executable if getattr(sys, 'frozen', False) else __file__))
-    p = os.path.join(base, exe_name)
-    if os.path.exists(p): return p
+    for name in [exe_name] + alt_names:
+        p = os.path.join(base, name)
+        if os.path.exists(p): return p
     # 3. Mac dev path
     p = os.path.expanduser(f'~/WingTheatre/{exe_name}')
     if os.path.exists(p): return p

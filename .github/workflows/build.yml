@@ -72,6 +72,16 @@ jobs:
       - name: Build app
         run: |
           chmod +x wingmon-macos
+          # Rename to the plain name _find_wingmon_path() actually looks
+          # for on macOS ('wingmon', no suffix). The artifact/build name
+          # 'wingmon-macos' only exists to distinguish it from the Windows
+          # artifact during the earlier build-wingmon jobs -- bundling it
+          # under that same name meant the app could never find it unless
+          # a local dev copy happened to exist at ~/WingTheatre/wingmon as
+          # a fallback (which is why this went unnoticed testing on the
+          # dev machine, but failed for every other tester).
+          cp wingmon-macos wingmon
+          chmod +x wingmon
           # Write version file
           echo "${{ github.ref_name }} (build ${{ github.run_number }}, $(date +%Y-%m-%d))" > version.txt
           # Copy propmap from libwing
@@ -86,11 +96,29 @@ jobs:
           echo "=== propmap.jsonl EQ-related sample (first 10 matches) ==="
           grep -m 10 '"/ch/1/eq/' propmap.jsonl || echo "no /ch/1/eq/ entries found"
           echo "=== end propmap.jsonl sample ==="
+          # DIAGNOSTIC: full /ch/1/eq/ dump. User reports that even on the
+          # STANDARD (STD) EQ model -- which DOES have propmap entries,
+          # unlike other models -- only the TOP band recalls correctly.
+          # This checks whether propmap.jsonl is simply missing entries for
+          # bands 2+ even within STD, or whether all bands are present and
+          # the bug is elsewhere.
+          echo "=== propmap.jsonl FULL /ch/1/eq/ dump ==="
+          grep '"fullname":"/ch/1/eq/' propmap.jsonl
+          echo "=== end /ch/1/eq/ dump ==="
+          echo "=== propmap.jsonl total entries with an index field ==="
+          grep -c '"index"' propmap.jsonl || echo "0"
+          echo "=== propmap.jsonl /ch/1/gate/ entries (all models?) ==="
+          grep '"fullname":"/ch/1/gate/' propmap.jsonl | head -30
+          echo "=== propmap.jsonl /ch/1/dyn/ entries (all models?) ==="
+          grep '"fullname":"/ch/1/dyn/' propmap.jsonl | head -30
+          echo "=== propmap.jsonl /ch/1/flt/ entries (all models?) ==="
+          grep '"fullname":"/ch/1/flt/' propmap.jsonl | head -30
+          echo "=== end propmap.jsonl model-coverage diagnostic ==="
           rm -rf libwing_tmp
           pyinstaller \
             --name "Wing Theatre Controller" \
             --windowed \
-            --add-data "wingmon-macos:." \
+            --add-data "wingmon:." \
             --add-data "propmap.jsonl:." \
             --add-data "version.txt:." \
             --hidden-import PyQt6.sip \
