@@ -5,6 +5,7 @@ DiGiCo-inspired snapshot and cue list control for Behringer Wing Rack
 
 import sys
 import os
+import datetime
 import copy
 import json
 import threading
@@ -4989,9 +4990,33 @@ class MainWindow(QMainWindow):
         self._dirty = False
         self._autosave_timer = QTimer()
         self._autosave_timer.timeout.connect(self._autosave)
+        # Persistent diagnostic log -- every status-bar message (connection
+        # events, sync progress, propmap misses, model changes etc.) also
+        # gets written here with a timestamp, so it can be captured and sent
+        # for debugging without needing to watch the status bar live.
+        base = os.path.dirname(os.path.abspath(
+            sys.executable if getattr(sys, 'frozen', False) else __file__))
+        self._log_file_path = os.path.join(base, 'wing_theatre_log.txt')
+        try:
+            with open(self._log_file_path, 'a', encoding='utf-8') as f:
+                f.write(f"\n=== Session started {datetime.datetime.now().isoformat()} ===\n")
+        except Exception:
+            pass
         self._setup_ui(); self._connect_signals(); self._new_show()
         # Wire OscServer to settings panel so Start/Stop buttons work
         self.osc_settings_panel.set_osc_server(self.osc_server)
+
+    def _log_to_file(self, msg):
+        """Append a timestamped line to wing_theatre_log.txt next to the
+        app. Same file location/pattern as crash_log.txt, so both are easy
+        to find together. Silently does nothing if the file can't be
+        written (e.g. read-only install location) -- this must never be
+        the reason something else breaks."""
+        try:
+            with open(self._log_file_path, 'a', encoding='utf-8') as f:
+                f.write(f"{datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]}  {msg}\n")
+        except Exception:
+            pass
 
     def eventFilter(self, obj, event):
         """Block mouse interaction on the autosave spinbox text field."""
@@ -5094,6 +5119,7 @@ class MainWindow(QMainWindow):
         self.osc.connected.connect(self._on_connected)
         self.osc.sync_complete.connect(self._on_sync_complete)
         self.osc.log_message.connect(self.status_bar.showMessage)
+        self.osc.log_message.connect(self._log_to_file)
         self.osc.capture_done.connect(self._on_capture_done)
         self.osc.parameter_received.connect(
             self._on_parameter_received,
