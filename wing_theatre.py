@@ -701,6 +701,7 @@ class WingOSC(QObject):
     connection_ready   = pyqtSignal()   # emitted on main thread after connect
     capture_finished   = pyqtSignal()   # emitted from wingmon thread -> finish on main
     sync_complete      = pyqtSignal(int)   # initial state sync done (param count)
+    unresolved_prop    = pyqtSignal(str, str, int, str)  # section, model, idx, raw value -- for the Model Map discovery dialog
     WING_PORT    = 2223
     WINGMON_PATH = _find_wingmon_path()
     PROPMAP_PATH   = _find_propmap_path()
@@ -932,19 +933,91 @@ class WingOSC(QObject):
 
     def _is_float_path(self, path):
         """Check whether a runtime path is a known float-typed parameter,
-        channel/bus-number-agnostic (see _load_dynamic_propmap)."""
+        channel/bus-number-agnostic (see _load_dynamic_propmap).
+
+        Handles TWO path shapes that both occur in practice:
+          - /ch/N/eq/1g            (propN-resolved, via our propmap lookup
+            -- most band-indexed params, no model segment)
+          - /ch/N/eq/STD/hf        (sent directly by Wing as a fully named
+            event, WITH the model segment -- confirmed from a real capture:
+            the high-shelf band comes through this way even though every
+            other EQ band comes through the plain, model-less form above.
+            Both shapes are real and must both be recognised.)
+        """
         fk = getattr(self, '_float_keys', None)
         if not fk:
             return False
         parts = path.split('/')
-        if (len(parts) == 5 and parts[1] in ("ch","bus","mtx","main","dca")
-                and parts[3] in ("eq","gate","dyn","flt")):
-            return (parts[3], parts[4]) in fk['sectioned']
-        if len(parts) == 4 and parts[1] == "fx":
-            return ("fx", parts[3]) in fk['sectioned']
+        if len(parts) >= 5 and parts[1] in ("ch","bus","mtx","main","dca") and parts[3] in ("eq","gate","dyn","flt"):
+            # Try the plain (no-model) param first: /ch/N/section/param
+            if (parts[3], parts[4]) in fk['sectioned']:
+                return True
+            # Fall back to the model-included shape: /ch/N/section/MODEL/param
+            if len(parts) >= 6 and (parts[3], parts[5]) in fk['sectioned']:
+                return True
+            return False
+        if len(parts) >= 4 and parts[1] == "fx":
+            if ("fx", parts[3]) in fk['sectioned']:
+                return True
+            if len(parts) >= 5 and ("fx", parts[4]) in fk['sectioned']:
+                return True
+            return False
         return path in fk['plain']
 
-    # ── Connection ────────────────────────────────────────────────────────────
+    def _model_map_path(self):
+        base = os.path.dirname(os.path.abspath(
+            sys.executable if getattr(sys, 'frozen', False) else __file__))
+        return os.path.join(base, 'wing_model_map.json')
+
+    def _load_model_map(self):
+        """Load the user-built (section, model, index) -> param map. This is
+        OUR OWN discovery, filling gaps that propmap.jsonl can't cover since
+        it only documents one (default) model per section. Lives next to
+        the app, same folder as crash_log.txt / wing_theatre_log.txt."""
+        import json
+        try:
+            with open(self._model_map_path()) as f:
+                raw = json.load(f)
+            return {(e['section'], e['model'], e['index']): e['param'] for e in raw}
+        except Exception:
+            return {}
+
+    def _save_model_map(self):
+        import json
+        entries = [{"section": s, "model": m, "index": i, "param": p}
+                   for (s, m, i), p in self._model_map.items()]
+        try:
+            with open(self._model_map_path(), 'w') as f:
+                json.dump(entries, f, indent=2)
+        except Exception as e:
+            self.log_message.emit(f"Could not save model map: {e}")
+
+    def _resolve_prop(self, section, model, idx, ch_path, val_str):
+        """Resolve a propN event to a parameter name. Tries, in order:
+        1. Our own live-discovered model_map (real per-model data, built via
+           the Model Map dialog).
+        2. propmap.jsonl (only ever describes ONE canonical model per
+           section -- fine when the active model happens to match it, wrong
+           otherwise; see _load_dynamic_propmap).
+        If neither has it, records it into _unresolved_props (and emits
+        unresolved_prop) so the Model Map dialog can show it live for the
+        user to name while operating that control on the console, and
+        returns None so the caller does NOT store/forward a mislabeled
+        value -- silence is safer than a wrong parameter name.
+        """
+        param = self._model_map.get((section, model, idx))
+        if param:
+            return param
+        param = self._prop_lookup.get((section, idx))
+        if param:
+            return param
+        # Unresolved -- track for the discovery dialog, don't guess.
+        key = (section, model, idx)
+        entry = self._unresolved_props.setdefault(key, {"ch_path": ch_path, "count": 0})
+        entry["count"] += 1
+        entry["value"] = val_str
+        self.unresolved_prop.emit(section, model, idx, val_str)
+        return None
 
     def connect(self, ip, port=2223, local_ip="0.0.0.0"):
         """Connect to Wing via wingmon TCP. No OSC socket needed."""
@@ -979,6 +1052,8 @@ class WingOSC(QObject):
         import subprocess, threading
         try:
             self._prop_lookup, self._float_keys = self._load_dynamic_propmap()
+            self._model_map = self._load_model_map()
+            self._unresolved_props = {}   # (section, model, idx) -> {"ch_path","value","count"} -- feeds the Model Map discovery dialog
             self._dyn_models    = {}
             self._wingmon_running = True
 
@@ -1113,13 +1188,12 @@ class WingOSC(QObject):
         - propN = value        -> dynamic property, resolved via current_ctx
         """
         import re
-        prop_re = re.compile(r"^prop(\d+) = (.+)$")
+        # Group 1: index (still used for diagnostics/logging)
+        # Group 2: optional 8-hex-digit raw hash -- Wing's own unambiguous
+        # address for this exact parameter, present whenever the index
+        # alone would be ambiguous across models (see print_node/wingmon.rs)
+        prop_re = re.compile(r"^prop(\d+)(?:#([0-9a-fA-F]{8}))? = (.+)$")
         current_ctx = {}
-        # Diagnostic: track (section, model) combos we've already warned
-        # about, so a propmap lookup miss for an unrecognised model (e.g.
-        # a model name mismatch between propmap.jsonl and what Wing
-        # actually sends) gets logged once, not spammed for every propN.
-        _prop_miss_warned = set()
         # Diagnostic: log each distinct model name the first time it's seen
         # (not per-channel -- that would be 48+ messages on every connect),
         # so the exact string Wing uses (e.g. for "Dual Dynamic EQ") is
@@ -1170,31 +1244,46 @@ class WingOSC(QObject):
                     # DATA propN -- resolve using current capture context
                     m = prop_re.match(rest.strip())
                     if m:
-                        idx     = int(m.group(1))
-                        val_str = m.group(2).strip()
+                        idx      = int(m.group(1))
+                        hash_hex = m.group(2)
+                        val_str  = m.group(3).strip()
                         for section, (ch_path, model) in list(current_ctx.items()):
-                            param = self._prop_lookup.get((section, idx))
-                            if param:
-                                if section == 'fx':
-                                    path = f"{ch_path}/{param}"
-                                else:
-                                    path = f"{ch_path}/{section}/{param}"
-                                try:
-                                    value = self._parse_wing_val(path, val_str)
-                                except ValueError:
-                                    value = val_str
+                            if hash_hex:
+                                # Hash-direct: Wing's own unambiguous address
+                                # for this exact parameter, regardless of
+                                # which model is loaded. Store the RAW string
+                                # verbatim -- no int/float reinterpretation --
+                                # so recall can echo back exactly what Wing
+                                # sent, preserving whichever type Wing itself
+                                # chose. No name/model guessing needed at all.
+                                path  = f"{ch_path}/{section}/#{hash_hex.lower()}"
+                                value = val_str
                                 if self._capturing:
                                     with self._capture_buf_lock:
                                         self._capture_buf[path] = value
                                     self._au_baseline[path] = value
                                 with self._wing_state_lock:
                                     self._wing_state[path] = value
-                            elif (section, idx) not in _prop_miss_warned:
-                                _prop_miss_warned.add((section, idx))
-                                self.log_message.emit(
-                                    f"propmap: no entry for section='{section}' "
-                                    f"(prop{idx}, model='{model}') -- this "
-                                    f"parameter won't be captured/recalled")
+                            else:
+                                # Safety fallback for a wingmon build that
+                                # predates hash support -- name-based
+                                # resolution, same as before.
+                                param = self._resolve_prop(section, model, idx, ch_path, val_str)
+                                if param:
+                                    if section == 'fx':
+                                        path = f"{ch_path}/{param}"
+                                    else:
+                                        path = f"{ch_path}/{section}/{param}"
+                                    try:
+                                        value = self._parse_wing_val(path, val_str)
+                                    except ValueError:
+                                        value = val_str
+                                    if self._capturing:
+                                        with self._capture_buf_lock:
+                                            self._capture_buf[path] = value
+                                        self._au_baseline[path] = value
+                                    with self._wing_state_lock:
+                                        self._wing_state[path] = value
                         continue
 
                     if " = " not in rest:
@@ -1247,26 +1336,28 @@ class WingOSC(QObject):
                 # ── Resolve anonymous propN ───────────────────────────────────
                 m = prop_re.match(line)
                 if m:
-                    idx     = int(m.group(1))
-                    val_str = m.group(2).strip()
+                    idx      = int(m.group(1))
+                    hash_hex = m.group(2)
+                    val_str  = m.group(3).strip()
                     for section, (ch_path, model) in list(current_ctx.items()):
-                        param = self._prop_lookup.get((section, idx))
-                        if param:
-                            if section == 'fx':
-                                path = f"{ch_path}/{param}"
-                            else:
-                                path = f"{ch_path}/{section}/{param}"
-                            try:
-                                value = self._parse_wing_val(path, val_str)
-                            except ValueError:
-                                value = val_str
+                        if hash_hex:
+                            path  = f"{ch_path}/{section}/#{hash_hex.lower()}"
+                            value = val_str
                             self._emit_wing_event(path, value)
-                        elif (section, idx) not in _prop_miss_warned:
-                            _prop_miss_warned.add((section, idx))
-                            self.log_message.emit(
-                                f"propmap: no entry for section='{section}' "
-                                f"(prop{idx}, model='{model}') -- this "
-                                f"parameter won't be captured/recalled")
+                        else:
+                            # Safety fallback for a wingmon build that
+                            # predates hash support.
+                            param = self._resolve_prop(section, model, idx, ch_path, val_str)
+                            if param:
+                                if section == 'fx':
+                                    path = f"{ch_path}/{param}"
+                                else:
+                                    path = f"{ch_path}/{section}/{param}"
+                                try:
+                                    value = self._parse_wing_val(path, val_str)
+                                except ValueError:
+                                    value = val_str
+                                self._emit_wing_event(path, value)
                     continue
 
                 if '=' not in line:
@@ -1522,6 +1613,21 @@ class WingOSC(QObject):
                 continue
 
             if path not in faded_paths:
+                if '/#' in path:
+                    # Hash-addressed parameter (model-ambiguous when
+                    # captured -- see print_node/wingmon.rs). `value` is
+                    # already the raw string exactly as Wing sent it, with
+                    # no int/float reinterpretation at any point. Send it
+                    # back completely unchanged -- wingmon's encode_param
+                    # recognises the embedded hash and addresses the
+                    # parameter directly, and the untouched string
+                    # preserves whichever type (int/float/string) Wing
+                    # itself originally chose for it.
+                    with self._wing_state_lock:
+                        self._wing_state[path] = value
+                    is_pri = scope_key in ('mute', 'fader')
+                    params.append((path, str(value), is_pri))
+                    continue
                 # `value` was already correctly typed (int vs float) at
                 # capture time by _parse_wing_val, which checks propmap's
                 # float_paths. Re-deriving that here was redundant and could

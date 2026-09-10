@@ -18,7 +18,18 @@ fn print_node(tx: &mpsc::Sender<String>, prefix: &str, id: i32, val: &str) {
             use std::collections::HashSet;
             let u = HashSet::<u16>::from_iter(defs.iter().map(|(_, d)| d.index));
             if u.len() == 1 {
-                tx.send(format!("{}prop{} = {}", prefix, defs[0].1.index, val)).ok();
+                // Ambiguous across models (the same index means a different
+                // parameter depending on which model is loaded, e.g. index 7
+                // is "1q" for EQ model STD but "lmg" for EQ model SOUL --
+                // confirmed in Behringer's own Wing Remote Protocols doc).
+                // propmap.jsonl only ever documents ONE canonical model per
+                // section, so resolving purely from the index can silently
+                // apply the WRONG model's parameter name. The raw hash
+                // (id) is Wing's own unambiguous address for this exact
+                // parameter regardless of model -- send it alongside the
+                // index so the value can be captured and recalled by hash
+                // directly, with no name/model guessing needed at all.
+                tx.send(format!("{}prop{}#{:08x} = {}", prefix, defs[0].1.index, id as u32, val)).ok();
             }
         }
     }
@@ -28,7 +39,19 @@ fn print_node(tx: &mpsc::Sender<String>, prefix: &str, id: i32, val: &str) {
 /// Matches Wing Editor's wire format exactly.
 /// Hash bytes containing 0xdf are escaped with 0xde (Wing protocol requirement).
 fn encode_param(path: &str, val: &str) -> Option<Vec<u8>> {
-    let id = WingConsole::name_to_id(path)?;
+    // Hash-direct addressing: paths for ambiguous (model-dependent)
+    // parameters carry their raw hash embedded as a "#xxxxxxxx" suffix
+    // (see print_node) -- e.g. "/ch/5/gate/#a1b2c3d4". The prefix before
+    // '#' exists only for the Python side's own channel/section bookkeeping
+    // and recall-scope checks; it means nothing to Wing. When present, use
+    // the hash directly and skip name_to_id entirely -- this is Wing's own
+    // unambiguous addressing (confirmed supported: "WING will accept both
+    // OSC path or the native hash data... /ch/1/mute or /#f50f69f8").
+    let id = if let Some(hash_str) = path.rsplit('#').next().filter(|_| path.contains('#')) {
+        u32::from_str_radix(hash_str, 16).ok().map(|h| h as i32)?
+    } else {
+        WingConsole::name_to_id(path)?
+    };
     let id_bytes = id.to_be_bytes();
 
     // Escape 0xdf bytes in hash (Wing protocol)
