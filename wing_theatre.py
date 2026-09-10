@@ -1098,7 +1098,15 @@ class WingOSC(QObject):
                     self.connected.emit(True)   # ← enables Disconnect button immediately
                     self.log_message.emit(
                         f"Connected to Wing at {self.ip} -- syncing state…")
-                    self._wingmon_stdin("SYNC")
+                    # No command needed here -- wingmon already began its own
+                    # full SYNC (every ch/bus/main/mtx/dca/fx node, including
+                    # every section's active model) automatically at startup,
+                    # before it even started reading stdin. The DATA lines
+                    # from that sync are already on their way; we just wait
+                    # for SYNC_COMPLETE below. (A literal "SYNC" stdin command
+                    # used to be sent here, but wingmon never recognised it --
+                    # only BATCH_SET/SET/KEEPALIVE are handled -- so it was a
+                    # harmless no-op, just misleading.)
                     continue
 
                 if line.startswith("SYNC_COMPLETE"):
@@ -1471,16 +1479,17 @@ class WingOSC(QObject):
                 continue
 
             if path not in faded_paths:
+                # `value` was already correctly typed (int vs float) at
+                # capture time by _parse_wing_val, which checks propmap's
+                # float_paths. Re-deriving that here was redundant and could
+                # even flip an already-correct float back to int -- just
+                # trust the stored type.
                 v = value
                 if isinstance(v, str):
                     try:    v = int(v)
                     except ValueError:
                         try: v = float(v)
                         except ValueError: pass
-                if isinstance(v, float) and v == int(v) and 0 <= v <= 1:
-                    _fp = getattr(self, '_float_paths', set())
-                    if path not in _fp:
-                        v = int(v)
                 with self._wing_state_lock:
                     self._wing_state[path] = v
                 if isinstance(v, float):
