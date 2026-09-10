@@ -853,14 +853,31 @@ class WingOSC(QObject):
     def _load_dynamic_propmap(self):
         """
         Load propmap.jsonl to resolve anonymous propN events from wingmon.
-        Returns ({(section, model, index): param_name}, float_paths_set).
-        float_paths_set contains all fullnames with type 'linear float' or
-        'log float' — used to ensure EQ gain=0 recalls as set_float(0.0),
-        not set_int(0) which Wing interprets as step 0 (minimum value).
+        Returns ({(section, model, index): param_name}, float_key_sets).
+
+        float_key_sets is a dict with three members used to check whether a
+        given RUNTIME path is float-typed:
+          - 'plain': a set of literal fullname strings (for simple, non-model
+            params like /ch/N/fdr, /ch/N/pan -- propmap.jsonl lists these
+            per-channel, so exact string matching works).
+          - 'sectioned': a set of (section, model, param) tuples for
+            channel/bus/mtx/main/dca-scoped model params (eq/gate/dyn/flt).
+            propmap.jsonl only lists these ONCE, templated on channel 1 (e.g.
+            /ch/1/eq/STD/1g) -- comparing the raw fullname string against a
+            path built for a different channel (/ch/5/eq/STD/1g) would never
+            match, since the channel number differs. This is exactly why EQ/
+            Gate/Dynamics parameter values were failing to recall on any
+            channel except 1: they'd be misclassified as int-typed and sent
+            with the wrong wire encoding. Normalising away the channel/bus
+            number on both sides fixes this for every channel, not just 1.
+          - 'fx': a set of (model, param) tuples, same normalisation for FX
+            slots (propmap.jsonl templates these on slot 1 only).
         """
         import json
         lookup = {}
-        float_paths = set()
+        float_plain     = set()
+        float_sectioned = set()
+        float_fx        = set()
         CHANNEL_SECTIONS = {"eq", "gate", "dyn", "flt"}
         FLOAT_TYPES = {"linear float", "log float"}
         try:
@@ -873,21 +890,32 @@ class WingOSC(QObject):
                         tp   = e.get("type", "")
                         if not fn:
                             continue
-                        # Track float-type paths (no $ = not read-only)
-                        if tp in FLOAT_TYPES and "$" not in fn:
-                            float_paths.add(fn)
+                        parts = fn.split("/")
+                        is_float = tp in FLOAT_TYPES and "$" not in fn
+                        is_sectioned = (len(parts) >= 5 and
+                                        parts[1] in ("ch","bus","mtx","main","dca") and
+                                        parts[3] in CHANNEL_SECTIONS)
+                        is_fx = (len(parts) >= 5 and parts[1] == "fx")
+                        if is_float:
+                            if is_sectioned:
+                                sec, mdl, param = parts[3], parts[4], "/".join(parts[5:])
+                                if mdl and param:
+                                    float_sectioned.add((sec, mdl, param))
+                            elif is_fx:
+                                mdl, param = parts[3], "/".join(parts[4:])
+                                if mdl and param:
+                                    float_fx.add((mdl, param))
+                            else:
+                                float_plain.add(fn)
                         if pidx <= 0:
                             continue
-                        parts = fn.split("/")
-                        if len(parts) < 5:
-                            continue
                         # Per-channel: /ch/1/SECTION/MODEL/param
-                        if parts[1] in ("ch","bus","mtx","main","dca") and parts[3] in CHANNEL_SECTIONS:
+                        if is_sectioned:
                             sec, mdl, param = parts[3], parts[4], "/".join(parts[5:])
                             if mdl and param:
                                 lookup.setdefault((sec, mdl, pidx), param)
                         # FX slots: /fx/N/MODEL/param
-                        elif parts[1] == "fx" and len(parts) >= 5:
+                        elif is_fx:
                             mdl, param = parts[3], "/".join(parts[4:])
                             if mdl and param:
                                 lookup.setdefault(("fx", mdl, pidx), param)
@@ -895,12 +923,29 @@ class WingOSC(QObject):
                         pass
             self.log_message.emit(
                 f"Dynamic propmap: {len(lookup)} entries "
-                f"(EQ/Gate/Dyn/Filter/FX), {len(float_paths)} float-type params")
+                f"(EQ/Gate/Dyn/Filter/FX), "
+                f"{len(float_plain) + len(float_sectioned) + len(float_fx)} float-type params")
         except FileNotFoundError:
-            float_paths = set()
             self.log_message.emit(
                 "propmap.jsonl not found -- wingmon props won't be fully resolved")
-        return lookup, float_paths
+        return lookup, {'plain': float_plain, 'sectioned': float_sectioned, 'fx': float_fx}
+
+    def _is_float_path(self, path):
+        """Check whether a runtime path is a known float-typed parameter,
+        channel/bus/slot-agnostic (see _load_dynamic_propmap for why this
+        normalisation is needed)."""
+        fk = getattr(self, '_float_keys', None)
+        if not fk:
+            return False
+        parts = path.split('/')
+        if (len(parts) >= 5 and parts[1] in ("ch","bus","mtx","main","dca")
+                and parts[3] in ("eq","gate","dyn","flt")):
+            key = (parts[3], parts[4], "/".join(parts[5:]))
+            return key in fk['sectioned']
+        if len(parts) >= 5 and parts[1] == "fx":
+            key = (parts[3], "/".join(parts[4:]))
+            return key in fk['fx']
+        return path in fk['plain']
 
     # ── Connection ────────────────────────────────────────────────────────────
 
@@ -936,7 +981,7 @@ class WingOSC(QObject):
             return
         import subprocess, threading
         try:
-            self._prop_lookup, self._float_paths = self._load_dynamic_propmap()
+            self._prop_lookup, self._float_keys = self._load_dynamic_propmap()
             self._dyn_models    = {}
             self._wingmon_running = True
 
@@ -1055,8 +1100,7 @@ class WingOSC(QObject):
             # mode, filter type etc.) whose values can be 2, 3, 4... and
             # those must stay int, or wingmon sends set_float for a
             # parameter Wing expects as set_int.
-            float_paths = getattr(self, '_float_paths', set())
-            if path in float_paths:
+            if self._is_float_path(path):
                 return float(iv)
             return iv   # int param (boolean, enum/selector, etc.)
         except ValueError:
@@ -1269,8 +1313,7 @@ class WingOSC(QObject):
                             # value, not just 0/1 -- values outside [0,1]
                             # are NOT unambiguously float (genuine integer
                             # enum/selector params exist too).
-                            float_paths = getattr(self, '_float_paths', set())
-                            value = float(iv) if path in float_paths else iv
+                            value = float(iv) if self._is_float_path(path) else iv
                     except ValueError:
                         value = val_str
                     self._emit_wing_event(path, value)
@@ -1783,7 +1826,6 @@ class WingOSC(QObject):
         instead of one SET command per pair. Used by the fade engine so a
         tick with many simultaneously-fading parameters costs one write
         instead of many. Also updates _wing_state for each pair."""
-        float_paths = getattr(self, '_float_paths', set())
         parts = []
         for path, value in pairs:
             if isinstance(value, str):
@@ -1791,7 +1833,7 @@ class WingOSC(QObject):
                 except ValueError:
                     try: value = float(value)
                     except ValueError: pass
-            if isinstance(value, float) and value == int(value) and 0 <= value <= 1 and path not in float_paths:
+            if isinstance(value, float) and value == int(value) and 0 <= value <= 1 and not self._is_float_path(path):
                 value = int(value)
             with self._wing_state_lock:
                 self._wing_state[path] = value
