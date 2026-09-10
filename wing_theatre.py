@@ -854,31 +854,37 @@ class WingOSC(QObject):
     def _load_dynamic_propmap(self):
         """
         Load propmap.jsonl to resolve anonymous propN events from wingmon.
-        Returns ({(section, model, index): param_name}, float_key_sets).
+        Returns ({(section, index): param_name}, float_key_sets).
 
-        float_key_sets is a dict with three members used to check whether a
+        IMPORTANT (confirmed from real propmap.jsonl, Sep 2026 libwing):
+        fullname paths do NOT embed a model name. It's simply
+        /ch/1/eq/lg, /ch/1/eq/1g, /ch/1/eq/leq etc -- section then the
+        parameter name directly, e.g.:
+            {"fullname":"/ch/1/eq/lg","id":-959296371,"index":1,...}
+            {"fullname":"/ch/1/eq/1g","id":349565323,"index":5,...}
+        An EARLIER version of libwing (checked back in August) DID embed
+        the model in the path (/ch/1/eq/STD/lg) -- that schema is gone.
+        Our lookup previously assumed the old 5+-segment/model-in-path
+        shape, which made `param` always come out empty and `lookup` end
+        up with 0 entries -- explaining why every band-indexed parameter
+        (everything except explicitly-named ones) silently failed to
+        resolve, while models themselves (an unrelated, always-named /mdl
+        path) kept working fine.
+
+        float_key_sets is a dict with two members used to check whether a
         given RUNTIME path is float-typed:
-          - 'plain': a set of literal fullname strings (for simple, non-model
-            params like /ch/N/fdr, /ch/N/pan -- propmap.jsonl lists these
-            per-channel, so exact string matching works).
-          - 'sectioned': a set of (section, model, param) tuples for
-            channel/bus/mtx/main/dca-scoped model params (eq/gate/dyn/flt).
-            propmap.jsonl only lists these ONCE, templated on channel 1 (e.g.
-            /ch/1/eq/STD/1g) -- comparing the raw fullname string against a
-            path built for a different channel (/ch/5/eq/STD/1g) would never
-            match, since the channel number differs. This is exactly why EQ/
-            Gate/Dynamics parameter values were failing to recall on any
-            channel except 1: they'd be misclassified as int-typed and sent
-            with the wrong wire encoding. Normalising away the channel/bus
-            number on both sides fixes this for every channel, not just 1.
-          - 'fx': a set of (model, param) tuples, same normalisation for FX
-            slots (propmap.jsonl templates these on slot 1 only).
+          - 'plain': literal fullname strings, for anything not matching
+            the sectioned pattern (still exact-match, e.g. /ch/N/fdr).
+          - 'sectioned': (section, param) tuples, channel/bus-number
+            agnostic (propmap.jsonl only lists channel 1, e.g. /ch/1/eq/lg
+            -- comparing against a path built for /ch/5/eq/lg needs the
+            channel number ignored, same reasoning as before, just without
+            the model dimension that never actually existed).
         """
         import json
         lookup = {}
         float_plain     = set()
         float_sectioned = set()
-        float_fx        = set()
         CHANNEL_SECTIONS = {"eq", "gate", "dyn", "flt"}
         FLOAT_TYPES = {"linear float", "log float"}
         try:
@@ -893,59 +899,49 @@ class WingOSC(QObject):
                             continue
                         parts = fn.split("/")
                         is_float = tp in FLOAT_TYPES and "$" not in fn
-                        is_sectioned = (len(parts) >= 5 and
+                        # /ch/1/eq/lg -> parts = ['', 'ch', '1', 'eq', 'lg']
+                        is_sectioned = (len(parts) == 5 and
                                         parts[1] in ("ch","bus","mtx","main","dca") and
                                         parts[3] in CHANNEL_SECTIONS)
-                        is_fx = (len(parts) >= 5 and parts[1] == "fx")
-                        if is_float:
-                            if is_sectioned:
-                                sec, mdl, param = parts[3], parts[4], "/".join(parts[5:])
-                                if mdl and param:
-                                    float_sectioned.add((sec, mdl, param))
-                            elif is_fx:
-                                mdl, param = parts[3], "/".join(parts[4:])
-                                if mdl and param:
-                                    float_fx.add((mdl, param))
-                            else:
-                                float_plain.add(fn)
-                        if pidx <= 0:
-                            continue
-                        # Per-channel: /ch/1/SECTION/MODEL/param
+                        # /fx/1/mix -> parts = ['', 'fx', '1', 'mix']
+                        is_fx = (len(parts) == 4 and parts[1] == "fx")
                         if is_sectioned:
-                            sec, mdl, param = parts[3], parts[4], "/".join(parts[5:])
-                            if mdl and param:
-                                lookup.setdefault((sec, mdl, pidx), param)
-                        # FX slots: /fx/N/MODEL/param
+                            sec, param = parts[3], parts[4]
+                            if is_float:
+                                float_sectioned.add((sec, param))
+                            if pidx > 0:
+                                lookup.setdefault((sec, pidx), param)
                         elif is_fx:
-                            mdl, param = parts[3], "/".join(parts[4:])
-                            if mdl and param:
-                                lookup.setdefault(("fx", mdl, pidx), param)
+                            param = parts[3]
+                            if is_float:
+                                float_sectioned.add(("fx", param))
+                            if pidx > 0:
+                                lookup.setdefault(("fx", pidx), param)
+                        elif is_float:
+                            float_plain.add(fn)
                     except Exception:
                         pass
             self.log_message.emit(
                 f"Dynamic propmap: {len(lookup)} entries "
                 f"(EQ/Gate/Dyn/Filter/FX), "
-                f"{len(float_plain) + len(float_sectioned) + len(float_fx)} float-type params")
+                f"{len(float_plain) + len(float_sectioned)} float-type params")
         except FileNotFoundError:
             self.log_message.emit(
                 "propmap.jsonl not found -- wingmon props won't be fully resolved")
-        return lookup, {'plain': float_plain, 'sectioned': float_sectioned, 'fx': float_fx}
+        return lookup, {'plain': float_plain, 'sectioned': float_sectioned}
 
     def _is_float_path(self, path):
         """Check whether a runtime path is a known float-typed parameter,
-        channel/bus/slot-agnostic (see _load_dynamic_propmap for why this
-        normalisation is needed)."""
+        channel/bus-number-agnostic (see _load_dynamic_propmap)."""
         fk = getattr(self, '_float_keys', None)
         if not fk:
             return False
         parts = path.split('/')
-        if (len(parts) >= 5 and parts[1] in ("ch","bus","mtx","main","dca")
+        if (len(parts) == 5 and parts[1] in ("ch","bus","mtx","main","dca")
                 and parts[3] in ("eq","gate","dyn","flt")):
-            key = (parts[3], parts[4], "/".join(parts[5:]))
-            return key in fk['sectioned']
-        if len(parts) >= 5 and parts[1] == "fx":
-            key = (parts[3], "/".join(parts[4:]))
-            return key in fk['fx']
+            return (parts[3], parts[4]) in fk['sectioned']
+        if len(parts) == 4 and parts[1] == "fx":
+            return ("fx", parts[3]) in fk['sectioned']
         return path in fk['plain']
 
     # ── Connection ────────────────────────────────────────────────────────────
@@ -1177,12 +1173,12 @@ class WingOSC(QObject):
                         idx     = int(m.group(1))
                         val_str = m.group(2).strip()
                         for section, (ch_path, model) in list(current_ctx.items()):
-                            param = self._prop_lookup.get((section, model, idx))
+                            param = self._prop_lookup.get((section, idx))
                             if param:
                                 if section == 'fx':
-                                    path = f"{ch_path}/{model}/{param}"
+                                    path = f"{ch_path}/{param}"
                                 else:
-                                    path = f"{ch_path}/{section}/{model}/{param}"
+                                    path = f"{ch_path}/{section}/{param}"
                                 try:
                                     value = self._parse_wing_val(path, val_str)
                                 except ValueError:
@@ -1193,12 +1189,12 @@ class WingOSC(QObject):
                                     self._au_baseline[path] = value
                                 with self._wing_state_lock:
                                     self._wing_state[path] = value
-                            elif (section, model) not in _prop_miss_warned:
-                                _prop_miss_warned.add((section, model))
+                            elif (section, idx) not in _prop_miss_warned:
+                                _prop_miss_warned.add((section, idx))
                                 self.log_message.emit(
                                     f"propmap: no entry for section='{section}' "
-                                    f"model='{model}' (prop{idx}) -- this model's "
-                                    f"parameters won't be captured/recalled")
+                                    f"(prop{idx}, model='{model}') -- this "
+                                    f"parameter won't be captured/recalled")
                         continue
 
                     if " = " not in rest:
@@ -1254,23 +1250,23 @@ class WingOSC(QObject):
                     idx     = int(m.group(1))
                     val_str = m.group(2).strip()
                     for section, (ch_path, model) in list(current_ctx.items()):
-                        param = self._prop_lookup.get((section, model, idx))
+                        param = self._prop_lookup.get((section, idx))
                         if param:
                             if section == 'fx':
-                                path = f"{ch_path}/{model}/{param}"
+                                path = f"{ch_path}/{param}"
                             else:
-                                path = f"{ch_path}/{section}/{model}/{param}"
+                                path = f"{ch_path}/{section}/{param}"
                             try:
                                 value = self._parse_wing_val(path, val_str)
                             except ValueError:
                                 value = val_str
                             self._emit_wing_event(path, value)
-                        elif (section, model) not in _prop_miss_warned:
-                            _prop_miss_warned.add((section, model))
+                        elif (section, idx) not in _prop_miss_warned:
+                            _prop_miss_warned.add((section, idx))
                             self.log_message.emit(
                                 f"propmap: no entry for section='{section}' "
-                                f"model='{model}' (prop{idx}) -- this model's "
-                                f"parameters won't be captured/recalled")
+                                f"(prop{idx}, model='{model}') -- this "
+                                f"parameter won't be captured/recalled")
                     continue
 
                 if '=' not in line:
