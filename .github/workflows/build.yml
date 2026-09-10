@@ -77,6 +77,15 @@ jobs:
           # Copy propmap from libwing
           git clone https://github.com/dannyfiresnake/libwing.git libwing_tmp
           cp libwing_tmp/src/propmap.jsonl propmap.jsonl || echo "propmap not found, skipping"
+          # DIAGNOSTIC: print sample lines to the Actions log so the exact
+          # current schema (field names) can be inspected without needing
+          # to locate the file on a local machine. Safe to remove once the
+          # propmap parsing bug is confirmed fixed.
+          echo "=== propmap.jsonl sample (first 15 lines) ==="
+          head -15 propmap.jsonl || echo "propmap.jsonl not present"
+          echo "=== propmap.jsonl EQ-related sample (first 10 matches) ==="
+          grep -m 10 '"/ch/1/eq/' propmap.jsonl || echo "no /ch/1/eq/ entries found"
+          echo "=== end propmap.jsonl sample ==="
           rm -rf libwing_tmp
           pyinstaller \
             --name "Wing Theatre Controller" \
