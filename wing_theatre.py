@@ -1221,11 +1221,17 @@ class WingOSC(QObject):
                                 f"Model seen: {parts[3]} = '{mdl_name}'")
                     elif path.endswith('/mdl') and len(parts) >= 4 and parts[1] == 'fx':
                         current_ctx['fx'] = ('/fx/' + parts[2], val_str.strip())
-                    elif len(parts) >= 5 and parts[3] in ('eq','gate','dyn','flt'):
-                        ch_path = '/' + '/'.join(parts[1:3])
-                        model   = parts[4] if len(parts) > 4 else ''
-                        if model and model not in ('on','mdl',''):
-                            current_ctx[parts[3]] = (ch_path, model)
+                    # NOTE: previously there was a fallback here that guessed
+                    # a "model" from ANY named path with 5+ segments under
+                    # eq/gate/dyn/flt (treating parts[4] as the model name).
+                    # That's wrong for non-model-nested params that also live
+                    # directly under these sections -- e.g. /ch/1/eq/mix or
+                    # /ch/1/dyn/gain are real top-level parameters, not model
+                    # names, per Wing's own OSC command list. That fallback
+                    # was corrupting current_ctx (log showed "Model seen:
+                    # eq = 'mix'"), so it's removed -- context now comes
+                    # only from genuine /mdl lines, which Wing reliably
+                    # sends for every section during SYNC.
 
                     try:
                         value = self._parse_wing_val(path, val_str)
@@ -1295,15 +1301,12 @@ class WingOSC(QObject):
                         self._emit_wing_event(path, val_str.strip())
                         continue
 
-                    if len(parts) >= 4 and parts[3] in ('eq','gate','dyn','flt'):
-                        ch_path = '/' + '/'.join(parts[1:3])
-                        model   = parts[4] if len(parts) > 4 else ''
-                        if model and model not in ('on','mdl',''):
-                            current_ctx[parts[3]] = (ch_path, model)
-                    elif len(parts) >= 3 and parts[1] == 'fx':
-                        model = parts[3] if len(parts) > 3 else ''
-                        if model:
-                            current_ctx['fx'] = ('/fx/' + parts[2], model)
+                    # NOTE: same removal as in the DATA-stream path above --
+                    # guessing a "model" from any named path under
+                    # eq/gate/dyn/flt/fx was corrupting current_ctx for
+                    # genuine non-model-nested parameters (e.g. /ch/1/eq/mix,
+                    # /ch/1/dyn/gain). Context now comes only from explicit
+                    # /mdl lines, handled above.
 
                     try:
                         if '.' in val_str:
