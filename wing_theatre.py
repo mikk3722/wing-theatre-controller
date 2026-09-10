@@ -708,7 +708,6 @@ class WingOSC(QObject):
     connection_ready   = pyqtSignal()   # emitted on main thread after connect
     capture_finished   = pyqtSignal()   # emitted from wingmon thread -> finish on main
     sync_complete      = pyqtSignal(int)   # initial state sync done (param count)
-    unresolved_prop    = pyqtSignal(str, str, int, str)  # section, model, idx, raw value -- for the Model Map discovery dialog
     WING_PORT    = 2223
     WINGMON_PATH = _find_wingmon_path()
     PROPMAP_PATH   = _find_propmap_path()
@@ -971,60 +970,17 @@ class WingOSC(QObject):
             return False
         return path in fk['plain']
 
-    def _model_map_path(self):
-        base = os.path.dirname(os.path.abspath(
-            sys.executable if getattr(sys, 'frozen', False) else __file__))
-        return os.path.join(base, 'wing_model_map.json')
-
-    def _load_model_map(self):
-        """Load the user-built (section, model, index) -> param map. This is
-        OUR OWN discovery, filling gaps that propmap.jsonl can't cover since
-        it only documents one (default) model per section. Lives next to
-        the app, same folder as crash_log.txt / wing_theatre_log.txt."""
-        import json
-        try:
-            with open(self._model_map_path()) as f:
-                raw = json.load(f)
-            return {(e['section'], e['model'], e['index']): e['param'] for e in raw}
-        except Exception:
-            return {}
-
-    def _save_model_map(self):
-        import json
-        entries = [{"section": s, "model": m, "index": i, "param": p}
-                   for (s, m, i), p in self._model_map.items()]
-        try:
-            with open(self._model_map_path(), 'w') as f:
-                json.dump(entries, f, indent=2)
-        except Exception as e:
-            self.log_message.emit(f"Could not save model map: {e}")
-
     def _resolve_prop(self, section, model, idx, ch_path, val_str):
-        """Resolve a propN event to a parameter name. Tries, in order:
-        1. Our own live-discovered model_map (real per-model data, built via
-           the Model Map dialog).
-        2. propmap.jsonl (only ever describes ONE canonical model per
-           section -- fine when the active model happens to match it, wrong
-           otherwise; see _load_dynamic_propmap).
-        If neither has it, records it into _unresolved_props (and emits
-        unresolved_prop) so the Model Map dialog can show it live for the
-        user to name while operating that control on the console, and
-        returns None so the caller does NOT store/forward a mislabeled
-        value -- silence is safer than a wrong parameter name.
+        """Safety-net resolver for propN events from a wingmon build that
+        predates hash support (see print_node/wingmon.rs) -- current builds
+        always send the hash directly and this path is not exercised.
+        Falls back to propmap.jsonl (only ever describes ONE canonical
+        model per section -- fine when the active model happens to match
+        it, wrong otherwise; see _load_dynamic_propmap). Returns None on a
+        miss rather than guessing, since a wrong parameter name is worse
+        than no data at all.
         """
-        param = self._model_map.get((section, model, idx))
-        if param:
-            return param
-        param = self._prop_lookup.get((section, idx))
-        if param:
-            return param
-        # Unresolved -- track for the discovery dialog, don't guess.
-        key = (section, model, idx)
-        entry = self._unresolved_props.setdefault(key, {"ch_path": ch_path, "count": 0})
-        entry["count"] += 1
-        entry["value"] = val_str
-        self.unresolved_prop.emit(section, model, idx, val_str)
-        return None
+        return self._prop_lookup.get((section, idx))
 
     def connect(self, ip, port=2223, local_ip="0.0.0.0"):
         """Connect to Wing via wingmon TCP. No OSC socket needed."""
@@ -1059,8 +1015,6 @@ class WingOSC(QObject):
         import subprocess, threading
         try:
             self._prop_lookup, self._float_keys = self._load_dynamic_propmap()
-            self._model_map = self._load_model_map()
-            self._unresolved_props = {}   # (section, model, idx) -> {"ch_path","value","count"} -- feeds the Model Map discovery dialog
             self._dyn_models    = {}
             self._wingmon_running = True
 
@@ -1851,19 +1805,6 @@ class WingOSC(QObject):
         return 'dcas'
 
     # ── Fading ────────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _db_to_amp(db):
-        """dB to linear amplitude.  -144 dB = 0.0"""
-        if db <= -144.0: return 0.0
-        return 10.0 ** (db / 20.0)
-
-    @staticmethod
-    def _amp_to_db(amp):
-        """Linear amplitude -> dB.  0.0 -> -144 dB"""
-        import math
-        if amp <= 0: return -144.0
-        return 20.0 * math.log10(max(amp, 1e-8))
 
     def _start_fade(self, path, start_db, end_db, fade_secs, fps=40):
         """Queue a fade -- interpolates linearly in dB space for smooth visual movement."""
@@ -2795,7 +2736,6 @@ class RecallScopeWidget(QWidget):
         super().__init__()
         self.show     = show
         self.snapshot = None
-        self._global_mode = False   # True in DefaultScopeDialog -- all clicks update global scope
         self._build()
 
     # ── UI construction ───────────────────────────────────────────────────────
@@ -2974,14 +2914,6 @@ class RecallScopeWidget(QWidget):
     def set_toolbar_visible(self, visible: bool):
         """Show or hide the top toolbar -- used by DefaultScopeDialog for a cleaner embed."""
         self._top_toolbar.setVisible(visible)
-
-    def set_global_mode(self, enabled: bool):
-        """
-        Global defaults mode -- all circle clicks update snapshot.scope directly
-        instead of per-channel overrides. Used by DefaultScopeDialog so the
-        saved scope reflects what the user actually clicked.
-        """
-        self._global_mode = enabled
 
     def load_snapshot(self, snap):
         self.snapshot = snap
@@ -3427,17 +3359,6 @@ class RecallScopeWidget(QWidget):
 
 
 
-    def _global_all(self, value):
-        try:
-            if not self.snapshot:
-                return
-            for k in WING_SCOPE_KEYS:
-                self.snapshot.scope[k] = value
-            self.snapshot.channel_scopes.clear()
-            self._rebuild(restore_expansion=True)
-        except Exception:
-            import traceback; traceback.print_exc()
-
     def _set_all_scope(self, value):
         """Set all scope keys on/off for the current snapshot.
 
@@ -3661,10 +3582,6 @@ class ConnectionPanel(QWidget):
             self.status.setStyleSheet(f"color:{C['text2']};font-size:12px;")
             self.conn_btn.setText("Connect"); self.conn_btn.setObjectName("green_btn")
         self.conn_btn.setStyle(self.conn_btn.style())
-
-    @property
-    def auto_update_on(self):
-        return self.au_btn.isChecked()
 
 
 # ─── Cue List Panel ───────────────────────────────────────────────────────────
