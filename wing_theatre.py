@@ -1188,11 +1188,14 @@ class WingOSC(QObject):
         - propN = value        -> dynamic property, resolved via current_ctx
         """
         import re
-        # Group 1: index (still used for diagnostics/logging)
-        # Group 2: optional 8-hex-digit raw hash -- Wing's own unambiguous
-        # address for this exact parameter, present whenever the index
-        # alone would be ambiguous across models (see print_node/wingmon.rs)
-        prop_re = re.compile(r"^prop(\d+)(?:#([0-9a-fA-F]{8}))? = (.+)$")
+        # Group 1: section (eq/gate/dyn/flt/fx) -- explicit now, read
+        #   directly from Wing's own definitions on the wingmon side, not
+        #   guessed client-side. Only present for hash-addressed events.
+        # Group 2: index (still used for diagnostics/logging)
+        # Group 3: optional 8-hex-digit raw hash -- Wing's own unambiguous
+        #   address for this exact parameter.
+        # Group 4: value
+        prop_re = re.compile(r"^(?:([a-z]+):)?prop(\d+)(?:#([0-9a-fA-F]{8}))? = (.+)$")
         current_ctx = {}
         # Diagnostic: log each distinct model name the first time it's seen
         # (not per-channel -- that would be 48+ messages on every connect),
@@ -1241,13 +1244,28 @@ class WingOSC(QObject):
                 if line.startswith("DATA "):
                     rest = line[5:]
 
-                    # DATA propN -- resolve using current capture context
+                    # DATA propN -- resolve using explicit section when
+                    # given (hash-addressed case), else fall back to trying
+                    # every currently-tracked section (pre-hash wingmon).
                     m = prop_re.match(rest.strip())
                     if m:
-                        idx      = int(m.group(1))
-                        hash_hex = m.group(2)
-                        val_str  = m.group(3).strip()
-                        for section, (ch_path, model) in list(current_ctx.items()):
+                        wire_section = m.group(1)
+                        idx          = int(m.group(2))
+                        hash_hex     = m.group(3)
+                        val_str      = m.group(4).strip()
+                        if wire_section:
+                            # Explicit section from wingmon -- only resolve
+                            # if we've already seen this section's /mdl for
+                            # the current channel; never guess across other
+                            # sections when we know exactly which one this is.
+                            sections = ([(wire_section, current_ctx[wire_section])]
+                                        if wire_section in current_ctx else [])
+                        else:
+                            # Old-format event (no section given, pre-hash
+                            # wingmon) -- fall back to trying every
+                            # currently-tracked section, same as before.
+                            sections = list(current_ctx.items())
+                        for section, (ch_path, model) in sections:
                             if hash_hex:
                                 # Hash-direct: Wing's own unambiguous address
                                 # for this exact parameter, regardless of
@@ -1336,10 +1354,16 @@ class WingOSC(QObject):
                 # ── Resolve anonymous propN ───────────────────────────────────
                 m = prop_re.match(line)
                 if m:
-                    idx      = int(m.group(1))
-                    hash_hex = m.group(2)
-                    val_str  = m.group(3).strip()
-                    for section, (ch_path, model) in list(current_ctx.items()):
+                    wire_section = m.group(1)
+                    idx          = int(m.group(2))
+                    hash_hex     = m.group(3)
+                    val_str      = m.group(4).strip()
+                    if wire_section:
+                        sections = ([(wire_section, current_ctx[wire_section])]
+                                    if wire_section in current_ctx else [])
+                    else:
+                        sections = list(current_ctx.items())
+                    for section, (ch_path, model) in sections:
                         if hash_hex:
                             path  = f"{ch_path}/{section}/#{hash_hex.lower()}"
                             value = val_str

@@ -29,7 +29,26 @@ fn print_node(tx: &mpsc::Sender<String>, prefix: &str, id: i32, val: &str) {
                 // parameter regardless of model -- send it alongside the
                 // index so the value can be captured and recalled by hash
                 // directly, with no name/model guessing needed at all.
-                tx.send(format!("{}prop{}#{:08x} = {}", prefix, defs[0].1.index, id as u32, val)).ok();
+                //
+                // The SECTION (eq/gate/dyn/flt/fx) is structural, not
+                // model-dependent -- every candidate def here shares the
+                // same section even though their names differ per model --
+                // so it's safe to read from defs[0]'s own path and send it
+                // explicitly. Without this, the receiving side would have
+                // to guess which of several simultaneously-active sections
+                // a bare "propN#hash" event belongs to, and could easily
+                // apply the same value to the wrong section.
+                let parts: Vec<&str> = defs[0].0.split('/').collect();
+                let section = if parts.len() >= 2 && parts[1] == "fx" {
+                    "fx"
+                } else if parts.len() >= 4 {
+                    parts[3]
+                } else {
+                    ""
+                };
+                if !section.is_empty() {
+                    tx.send(format!("{}{}:prop{}#{:08x} = {}", prefix, section, defs[0].1.index, id as u32, val)).ok();
+                }
             }
         }
     }
