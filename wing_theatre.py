@@ -1976,6 +1976,17 @@ class WingOSC(QObject):
         self._unified_timer.stop()
         self._fade_jobs.clear()
 
+    def jump_fades_to_target(self):
+        """Stop every active fade immediately and snap each of its
+        parameters straight to its final target value, instead of just
+        stopping wherever the fade happened to be. Used by the 'Cancel
+        fade' button next to GO."""
+        if not self._fade_jobs:
+            return
+        pairs = [(job[0], job[2]) for job in self._fade_jobs]   # (path, end_db)
+        self._send_params_batch(pairs)
+        self._cancel_all_fades()
+
 
 
 
@@ -3034,11 +3045,27 @@ class RecallScopeWidget(QWidget):
                 item.setBackground(col, QColor(C['bg3']))
                 continue
             global_val = global_scope.get(sk, True)
-            # Read-only lookup -- do NOT use get_ch_scope() which would mutate channel_scopes
-            vals = [(self.snapshot.channel_scopes[ck].overrides.get(sk, global_val)
-                     if ck in self.snapshot.channel_scopes
-                     else global_val)
-                    for ck in ch_keys]
+            if sk == 'sends':
+                # Same reasoning as the per-channel circle: reflect the
+                # real state of every channel's individual bus/matrix
+                # overrides, not just the flat fallback flag.
+                vals = []
+                for ck in ch_keys:
+                    if ck.startswith('dca_'):
+                        continue
+                    cs_ck = (self.snapshot.channel_scopes[ck]
+                             if ck in self.snapshot.channel_scopes else None)
+                    fallback = cs_ck.overrides.get(sk, global_val) if cs_ck else global_val
+                    if (ck.startswith('input_') or ck.startswith('bus_')) and cs_ck and cs_ck.send_overrides:
+                        vals.extend(cs_ck.send_overrides.get(d, fallback) for d in SEND_DEST_KEYS)
+                    else:
+                        vals.append(fallback)
+            else:
+                # Read-only lookup -- do NOT use get_ch_scope() which would mutate channel_scopes
+                vals = [(self.snapshot.channel_scopes[ck].overrides.get(sk, global_val)
+                         if ck in self.snapshot.channel_scopes
+                         else global_val)
+                        for ck in ch_keys]
             if not vals:
                 circle = CIRCLE_ON if global_val else CIRCLE_OFF
             elif all(vals):
@@ -3125,6 +3152,22 @@ class RecallScopeWidget(QWidget):
             if is_dca and sk not in DCA_APPLICABLE:
                 item.setText(col, " --")
                 item.setForeground(col, QColor(C['text3']))
+            elif sk == 'sends' and (ch_key.startswith('input_') or ch_key.startswith('bus_')):
+                # The aggregate Sends circle should reflect the REAL state
+                # of every individual bus/matrix override, same as any
+                # other aggregate circle -- partial (half circle) when
+                # they're mixed, not just a flat on/off from the fallback
+                # flag alone.
+                global_val = global_scope.get(sk, True)
+                fallback = (cs.overrides.get(sk, global_val) if cs else global_val)
+                if cs and cs.send_overrides:
+                    vals = [cs.send_overrides.get(d, fallback) for d in SEND_DEST_KEYS]
+                    if all(vals):   circle = CIRCLE_ON
+                    elif any(vals): circle = CIRCLE_PART
+                    else:           circle = CIRCLE_OFF
+                else:
+                    circle = CIRCLE_ON if fallback else CIRCLE_OFF
+                item.setData(col, CIRCLE_ROLE, circle)
             else:
                 global_val = global_scope.get(sk, True)
                 val = (cs.overrides.get(sk, global_val) if cs else global_val)
@@ -3190,6 +3233,12 @@ class RecallScopeWidget(QWidget):
                     cs.overrides[sk] = new_val
                 else:
                     cs.overrides.pop(sk, None)
+                if sk == 'sends' and (ck.startswith('input_') or ck.startswith('bus_')):
+                    # The aggregate Sends toggle should mean ALL sends,
+                    # including every individually-customised bus/matrix
+                    # override -- not just the fallback flag those defer to.
+                    for dest in SEND_DEST_KEYS:
+                        cs.send_overrides[dest] = new_val
             item.setData(col, CIRCLE_ROLE, new_circ)
             for i in range(item.childCount()):
                 child = item.child(i)
@@ -3210,6 +3259,9 @@ class RecallScopeWidget(QWidget):
                 cs.overrides[sk] = new_val
             else:
                 cs.overrides.pop(sk, None)
+            if sk == 'sends' and (ck.startswith('input_') or ck.startswith('bus_')):
+                for dest in SEND_DEST_KEYS:
+                    cs.send_overrides[dest] = new_val
             item.setData(col, CIRCLE_ROLE, CIRCLE_ON if new_val else CIRCLE_OFF)
             self._refresh_group_col(item, col, sk)
 
@@ -3240,6 +3292,9 @@ class RecallScopeWidget(QWidget):
             item.setData(col, CIRCLE_ROLE, new_circ)
             for i in range(item.childCount()):
                 item.child(i).setData(col, CIRCLE_ROLE, new_circ)
+            self._refresh_sends_aggregate(item)
+            for i in range(item.childCount()):
+                self._refresh_sends_aggregate(item.child(i))
 
         elif data["type"] == "channel":
             ck = data["key"]
@@ -3251,6 +3306,10 @@ class RecallScopeWidget(QWidget):
             cs.send_overrides[dest] = new_val
             item.setData(col, CIRCLE_ROLE, CIRCLE_ON if new_val else CIRCLE_OFF)
             self._refresh_send_group_col(item, col, dest)
+            self._refresh_sends_aggregate(item)
+            parent = item.parent()
+            if parent:
+                self._refresh_sends_aggregate(parent)
 
         self.tree.viewport().update()
         self.scope_changed.emit()
@@ -3308,7 +3367,48 @@ class RecallScopeWidget(QWidget):
         self.tree.blockSignals(False)
         self.scope_changed.emit()
 
-    def _refresh_group_col(self, child_item, col, sk):
+    def _refresh_sends_aggregate(self, item):
+        """Recompute the aggregate Sends circle (SENDS_COL) for a channel
+        or group row from its real per-bus/matrix override state, after an
+        individual bus/matrix cell changed. Mirrors the logic used when
+        the row is first built."""
+        data = item.data(LABEL_COL, Qt.ItemDataRole.UserRole)
+        if not data:
+            return
+        global_val = self.snapshot.scope.get('sends', True)
+        if data["type"] == "channel":
+            ck = data["key"]
+            if not (ck.startswith("input_") or ck.startswith("bus_")):
+                return
+            cs = self.snapshot.channel_scopes.get(ck)
+            fallback = cs.overrides.get('sends', global_val) if cs else global_val
+            if cs and cs.send_overrides:
+                vals = [cs.send_overrides.get(d, fallback) for d in SEND_DEST_KEYS]
+            else:
+                vals = [fallback]
+        elif data["type"] == "group":
+            if data.get("key") not in ("inputs", "buses"):
+                return
+            vals = []
+            for ck in data.get("children", []):
+                if ck.startswith('dca_'):
+                    continue
+                cs_ck = self.snapshot.channel_scopes.get(ck)
+                fallback = cs_ck.overrides.get('sends', global_val) if cs_ck else global_val
+                if cs_ck and cs_ck.send_overrides:
+                    vals.extend(cs_ck.send_overrides.get(d, fallback) for d in SEND_DEST_KEYS)
+                else:
+                    vals.append(fallback)
+        else:
+            return
+        if not vals:
+            return
+        if all(vals):   circle = CIRCLE_ON
+        elif any(vals): circle = CIRCLE_PART
+        else:           circle = CIRCLE_OFF
+        item.setData(SENDS_COL, CIRCLE_ROLE, circle)
+
+
         parent = child_item.parent()
         if not parent:
             return
@@ -3316,11 +3416,24 @@ class RecallScopeWidget(QWidget):
         if not data:
             return
         global_val = self.snapshot.scope.get(sk, True)
-        # Read-only -- don't create channel scopes just for display
-        vals = [(self.snapshot.channel_scopes[ck].overrides.get(sk, global_val)
-                 if ck in self.snapshot.channel_scopes
-                 else global_val)
-                for ck in data.get("children", [])]
+        ch_keys = data.get("children", [])
+        if sk == 'sends':
+            vals = []
+            for ck in ch_keys:
+                if ck.startswith('dca_'):
+                    continue
+                cs_ck = self.snapshot.channel_scopes.get(ck)
+                fallback = cs_ck.overrides.get(sk, global_val) if cs_ck else global_val
+                if (ck.startswith('input_') or ck.startswith('bus_')) and cs_ck and cs_ck.send_overrides:
+                    vals.extend(cs_ck.send_overrides.get(d, fallback) for d in SEND_DEST_KEYS)
+                else:
+                    vals.append(fallback)
+        else:
+            # Read-only -- don't create channel scopes just for display
+            vals = [(self.snapshot.channel_scopes[ck].overrides.get(sk, global_val)
+                     if ck in self.snapshot.channel_scopes
+                     else global_val)
+                    for ck in ch_keys]
         if not vals:
             return
         if all(vals):   circle = CIRCLE_ON
@@ -3345,11 +3458,21 @@ class RecallScopeWidget(QWidget):
         self.snapshot.scope[sk] = new_val
         for cs in self.snapshot.channel_scopes.values():
             cs.overrides.pop(sk, None)
+        dca_blocked = sk not in DCA_APPLICABLE
         for i in range(self.tree.topLevelItemCount()):
             grp = self.tree.topLevelItem(i)
-            grp.setData(col, CIRCLE_ROLE, new_circle)
+            grp_data = grp.data(LABEL_COL, Qt.ItemDataRole.UserRole)
+            is_dca_group = dca_blocked and grp_data and grp_data.get("key") == "dcas"
+            if not is_dca_group:
+                grp.setData(col, CIRCLE_ROLE, new_circle)
             for j in range(grp.childCount()):
-                grp.child(j).setData(col, CIRCLE_ROLE, new_circle)
+                child = grp.child(j)
+                if dca_blocked:
+                    cd = child.data(LABEL_COL, Qt.ItemDataRole.UserRole)
+                    ck = cd.get("key", "") if cd else ""
+                    if ck.startswith("dca_"):
+                        continue   # leave DCA rows' " --" text untouched -- this column doesn't apply to them
+                child.setData(col, CIRCLE_ROLE, new_circle)
         self.tree.viewport().update()
         self.scope_changed.emit()
 
@@ -3743,6 +3866,7 @@ class CueListPanel(QWidget):
     snaps_set_group = pyqtSignal(list, str)
     snaps_set_scope = pyqtSignal(list, dict)
     multi_selected  = pyqtSignal(int)   # number of selected cues (0 or 1 = normal)
+    cancel_fade_pressed = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -3802,9 +3926,21 @@ class CueListPanel(QWidget):
         go_frame = QWidget()
         go_frame.setStyleSheet(f"background:{C['bg3']};")
         gl = QVBoxLayout(go_frame); gl.setContentsMargins(10, 10, 10, 10); gl.setSpacing(6)
+        go_row = QHBoxLayout(); go_row.setSpacing(6)
         self.go_btn = QPushButton("GO"); self.go_btn.setObjectName("go_btn")
         self.go_btn.setFixedHeight(52); self.go_btn.clicked.connect(self.go_pressed.emit)
-        gl.addWidget(self.go_btn); l.addWidget(go_frame)
+        self.cancel_fade_btn = QPushButton("Cancel fade")
+        self.cancel_fade_btn.setFixedHeight(52); self.cancel_fade_btn.setFixedWidth(100)
+        self.cancel_fade_btn.setToolTip(
+            "Stop any fades in progress right now and jump straight to their target values")
+        self.cancel_fade_btn.setStyleSheet(
+            f"QPushButton {{ background:{C['bg2']}; color:{C['text2']}; border:1px solid {C['border']}; "
+            f"border-radius:4px; font-size:11px; }} "
+            f"QPushButton:hover {{ background:{C['bg1']}; color:{C['text1']}; }}")
+        self.cancel_fade_btn.clicked.connect(self.cancel_fade_pressed.emit)
+        go_row.addWidget(self.go_btn, 1)
+        go_row.addWidget(self.cancel_fade_btn, 0)
+        gl.addLayout(go_row); l.addWidget(go_frame)
 
     # ── Selection helpers ────────────────────────────────────────────────────
 
@@ -5227,6 +5363,7 @@ class MainWindow(QMainWindow):
         self.conn_panel.live_btn.clicked.connect(self._toggle_live_mode)
         self.cue_panel.cue_selected.connect(self._on_cue_selected)
         self.cue_panel.go_pressed.connect(self._go)
+        self.cue_panel.cancel_fade_pressed.connect(self.osc.jump_fades_to_target)
         self.cue_panel.add_pressed.connect(self._add_snapshot)
         self.cue_panel.snap_reordered.connect(self._on_snaps_reordered)
         self.cue_panel.snap_duplicate.connect(self._on_snap_duplicate)
@@ -5496,6 +5633,7 @@ class MainWindow(QMainWindow):
                 self._mark_dirty()
                 self._refresh_cue_list()
                 self.cue_panel.set_current(n - 1)
+                self.cue_panel.mark_active(n - 1); self.active_cue_index = n - 1
                 self.status_bar.showMessage(
                     f"'{snap.name}' created with {len(snap.data)} parameters", 4000)
         except Exception:
