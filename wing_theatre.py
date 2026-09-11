@@ -1163,6 +1163,13 @@ class WingOSC(QObject):
         # so the exact string Wing uses (e.g. for "Dual Dynamic EQ") is
         # visible even if we've never seen it selected before.
         _seen_model_names = set()
+        # Diagnostic: a live hash-addressed event can arrive for a section
+        # whose /mdl context we haven't seen yet this session (e.g. tweaking
+        # a knob before that section's model has ever been reported) -- such
+        # an event has to be silently skipped since we don't know which
+        # channel it belongs to. Log it once per section so this is visible
+        # instead of just looking like "nothing happened".
+        _dropped_no_context = set()
         try:
             for line in self._wingmon_proc.stdout:
                 if not getattr(self, '_wingmon_running', False):
@@ -1320,8 +1327,16 @@ class WingOSC(QObject):
                     hash_hex     = m.group(3)
                     val_str      = m.group(4).strip()
                     if wire_section:
-                        sections = ([(wire_section, current_ctx[wire_section])]
-                                    if wire_section in current_ctx else [])
+                        if wire_section in current_ctx:
+                            sections = [(wire_section, current_ctx[wire_section])]
+                        else:
+                            sections = []
+                            if wire_section not in _dropped_no_context:
+                                _dropped_no_context.add(wire_section)
+                                self.log_message.emit(
+                                    f"Live event for section='{wire_section}' arrived before "
+                                    f"its model context was seen this session -- dropped "
+                                    f"(prop{idx}#{hash_hex}). Recall/capture once to establish context.")
                     else:
                         sections = list(current_ctx.items())
                     for section, (ch_path, model) in sections:
@@ -6064,7 +6079,7 @@ class MainWindow(QMainWindow):
                 snap.data[path] = value
                 changed = True
         if changed:
-            if scope_key in ('fader', 'sends'):
+            if scope_key in ('fader', 'sends', 'eq', 'gate', 'dyn', 'flt'):
                 self.status_bar.showMessage(
                     f"AU: wrote {path} = {value} to {len(targets)} cue(s)", 1500)
             self._mark_dirty()
