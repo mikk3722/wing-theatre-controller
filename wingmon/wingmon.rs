@@ -30,24 +30,30 @@ fn print_node(tx: &mpsc::Sender<String>, prefix: &str, id: i32, val: &str) {
                 // index so the value can be captured and recalled by hash
                 // directly, with no name/model guessing needed at all.
                 //
-                // The SECTION (eq/gate/dyn/flt/fx) is structural, not
+                // The CHANNEL and SECTION are both structural, not
                 // model-dependent -- every candidate def here shares the
-                // same section even though their names differ per model --
-                // so it's safe to read from defs[0]'s own path and send it
-                // explicitly. Without this, the receiving side would have
-                // to guess which of several simultaneously-active sections
-                // a bare "propN#hash" event belongs to, and could easily
-                // apply the same value to the wrong section.
+                // same channel/section even though their names differ per
+                // model -- so it's safe to read them from defs[0]'s own
+                // path and send them explicitly. Without this, the
+                // receiving side would have to guess which channel+section
+                // a bare "propN#hash" event belongs to from whatever it
+                // last saw reported -- and during the initial sync (which
+                // walks every channel/bus/main/mtx/dca/fx sequentially),
+                // that "last seen" context ends up pointing at whichever
+                // node happened to sync last, so live events for any OTHER
+                // channel get silently misattributed until that channel's
+                // own model gets freshly reported again (e.g. by touching
+                // the model selector).
                 let parts: Vec<&str> = defs[0].0.split('/').collect();
-                let section = if parts.len() >= 2 && parts[1] == "fx" {
-                    "fx"
+                let (channel, section) = if parts.len() >= 3 && parts[1] == "fx" {
+                    (format!("fx/{}", parts[2]), "fx".to_string())
                 } else if parts.len() >= 4 {
-                    parts[3]
+                    (format!("{}/{}", parts[1], parts[2]), parts[3].to_string())
                 } else {
-                    ""
+                    (String::new(), String::new())
                 };
-                if !section.is_empty() {
-                    tx.send(format!("{}{}:prop{}#{:08x} = {}", prefix, section, defs[0].1.index, id as u32, val)).ok();
+                if !channel.is_empty() && !section.is_empty() {
+                    tx.send(format!("{}{}:{}:prop{}#{:08x} = {}", prefix, channel, section, defs[0].1.index, id as u32, val)).ok();
                 }
             }
         }

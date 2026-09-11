@@ -1149,14 +1149,16 @@ class WingOSC(QObject):
         - propN = value        -> dynamic property, resolved via current_ctx
         """
         import re
-        # Group 1: section (eq/gate/dyn/flt/fx) -- explicit now, read
-        #   directly from Wing's own definitions on the wingmon side, not
-        #   guessed client-side. Only present for hash-addressed events.
-        # Group 2: index (still used for diagnostics/logging)
-        # Group 3: optional 8-hex-digit raw hash -- Wing's own unambiguous
+        # Group 1: channel (e.g. "ch/5", "fx/3") -- explicit now, read
+        #   directly from Wing's own definitions on the wingmon side, so we
+        #   never have to guess which channel an ambiguous event belongs to
+        #   based on whatever was last seen during sync.
+        # Group 2: section (eq/gate/dyn/flt/fx) -- also explicit.
+        # Group 3: index (still used for diagnostics/logging)
+        # Group 4: optional 8-hex-digit raw hash -- Wing's own unambiguous
         #   address for this exact parameter.
-        # Group 4: value
-        prop_re = re.compile(r"^(?:([a-z]+):)?prop(\d+)(?:#([0-9a-fA-F]{8}))? = (.+)$")
+        # Group 5: value
+        prop_re = re.compile(r"^(?:([a-z]+/\d+):([a-z]+):)?prop(\d+)(?:#([0-9a-fA-F]{8}))? = (.+)$")
         current_ctx = {}
         # Diagnostic: log each distinct model name the first time it's seen
         # (not per-channel -- that would be 48+ messages on every connect),
@@ -1212,25 +1214,33 @@ class WingOSC(QObject):
                 if line.startswith("DATA "):
                     rest = line[5:]
 
-                    # DATA propN -- resolve using explicit section when
-                    # given (hash-addressed case), else fall back to trying
-                    # every currently-tracked section (pre-hash wingmon).
+                    # DATA propN -- prefer the explicit channel+section from
+                    # wingmon (current builds always send both for
+                    # hash-addressed events); fall back to guessing from
+                    # current_ctx only for old-format events without them.
                     m = prop_re.match(rest.strip())
                     if m:
-                        wire_section = m.group(1)
-                        idx          = int(m.group(2))
-                        hash_hex     = m.group(3)
-                        val_str      = m.group(4).strip()
-                        if wire_section:
-                            # Explicit section from wingmon -- only resolve
-                            # if we've already seen this section's /mdl for
-                            # the current channel; never guess across other
-                            # sections when we know exactly which one this is.
+                        wire_channel = m.group(1)
+                        wire_section = m.group(2)
+                        idx          = int(m.group(3))
+                        hash_hex     = m.group(4)
+                        val_str      = m.group(5).strip()
+                        if wire_channel and wire_section:
+                            # Fully explicit -- channel and section both
+                            # read directly from Wing's own data on the
+                            # wingmon side, so nothing here needs to guess
+                            # which channel an event belongs to. Model is
+                            # only needed for the non-hash fallback path
+                            # below; use whatever's tracked, if anything.
+                            ch_path = '/' + wire_channel
+                            _, tracked_model = current_ctx.get(wire_section, (None, None))
+                            sections = [(wire_section, (ch_path, tracked_model))]
+                        elif wire_section:
                             sections = ([(wire_section, current_ctx[wire_section])]
                                         if wire_section in current_ctx else [])
                         else:
-                            # Old-format event (no section given, pre-hash
-                            # wingmon) -- fall back to trying every
+                            # Old-format event (no channel/section given,
+                            # pre-hash wingmon) -- fall back to trying every
                             # currently-tracked section, same as before.
                             sections = list(current_ctx.items())
                         for section, (ch_path, model) in sections:
@@ -1247,7 +1257,14 @@ class WingOSC(QObject):
                                 if self._capturing:
                                     with self._capture_buf_lock:
                                         self._capture_buf[path] = value
-                                    self._au_baseline[path] = value
+                                # Prime AU's baseline unconditionally during
+                                # sync (not gated by _capturing, which is
+                                # otherwise vestigial now) so AU has a real
+                                # reference point for every parameter from
+                                # the moment sync completes, instead of
+                                # treating the very first live touch of
+                                # anything as an unconditional "change".
+                                self._au_baseline[path] = value
                                 with self._wing_state_lock:
                                     self._wing_state[path] = value
                             else:
@@ -1267,7 +1284,7 @@ class WingOSC(QObject):
                                     if self._capturing:
                                         with self._capture_buf_lock:
                                             self._capture_buf[path] = value
-                                        self._au_baseline[path] = value
+                                    self._au_baseline[path] = value
                                     with self._wing_state_lock:
                                         self._wing_state[path] = value
                         continue
@@ -1314,7 +1331,7 @@ class WingOSC(QObject):
                     if self._capturing:
                         with self._capture_buf_lock:
                             self._capture_buf[path] = value
-                        self._au_baseline[path] = value
+                    self._au_baseline[path] = value
                     with self._wing_state_lock:
                         self._wing_state[path] = value
                     continue
@@ -1322,11 +1339,26 @@ class WingOSC(QObject):
                 # ── Resolve anonymous propN ───────────────────────────────────
                 m = prop_re.match(line)
                 if m:
-                    wire_section = m.group(1)
-                    idx          = int(m.group(2))
-                    hash_hex     = m.group(3)
-                    val_str      = m.group(4).strip()
-                    if wire_section:
+                    wire_channel = m.group(1)
+                    wire_section = m.group(2)
+                    idx          = int(m.group(3))
+                    hash_hex     = m.group(4)
+                    val_str      = m.group(5).strip()
+                    if wire_channel and wire_section:
+                        # Fully explicit -- channel and section both read
+                        # directly from Wing's own data on the wingmon
+                        # side. This is what fixes AU for eq/gate/dyn/flt:
+                        # previously, current_ctx[section] was a single
+                        # slot shared across ALL channels, overwritten by
+                        # whichever channel synced last -- so a live event
+                        # for channel 5 could get misattributed to channel
+                        # 12 (whoever was synced last) and silently written
+                        # to the wrong channel's scope, or dropped if that
+                        # channel wasn't in the AU section's channel list.
+                        ch_path = '/' + wire_channel
+                        _, tracked_model = current_ctx.get(wire_section, (None, None))
+                        sections = [(wire_section, (ch_path, tracked_model))]
+                    elif wire_section:
                         if wire_section in current_ctx:
                             sections = [(wire_section, current_ctx[wire_section])]
                         else:
@@ -1514,48 +1546,46 @@ class WingOSC(QObject):
 
     def start_capture(self, duration_ms=12000):
         """
-        Capture all Wing parameters.
-        Uses TCP GET via wingmon (fast, reliable). There is no OSC-polling
-        fallback -- wingmon is required for capture.
+        Capture current Wing parameters into the target cue.
+
+        Reads directly from _wing_state, which is continuously kept current
+        by the initial SYNC and every subsequent live event -- there is no
+        need to go back out to Wing at all, since we already have the
+        current value of everything Wing has ever told us this session.
+        This is instant and always reflects exactly what's known right now.
+
+        (Previously this sent "GET <node>" to wingmon and waited up to 8s
+        for a response -- but wingmon never actually implemented a GET
+        command, only BATCH_SET/SET/KEEPALIVE, so that request silently
+        did nothing every time. Whatever ended up in the result was only
+        ever whatever live events happened to arrive during that 8s
+        window, not an actual capture of current state.)
         """
-        if self._wingmon_running_ok():
-            self._start_capture_tcp()
-        else:
+        if not self._wingmon_running_ok():
             self.log_message.emit(
                 "Capture unavailable -- wingmon is not running. Reconnect to Wing and try again.")
-
-    def _start_capture_tcp(self):
-        """Fast capture: send GET for each top-level node via wingmon TCP."""
-        self._capture_buf   = {}
-        self._capturing     = True
-        nodes = self.CAPTURE_NODES
-        self._capture_nodes = set(nodes)
-        self.log_message.emit(
-            f"TCP Capture: requesting {len(nodes)} nodes (ch/bus/main/mtx/dca/fx)…")
-        for node in nodes:
-            self._wingmon_stdin(f"GET {node}")
-        # Safety timeout -- if DATA_END never arrives
-        self._capture_timer = QTimer(self)
-        self._capture_timer.setSingleShot(True)
-        self._capture_timer.timeout.connect(self._finish_capture)
-        self._capture_timer.start(8000)
-
-    def _finish_capture(self):
-        self._capturing = False
-        with self._capture_buf_lock:
-            data = dict(self._capture_buf)
-            self._capture_buf = {}
-
+            return
+        with self._wing_state_lock:
+            data = dict(self._wing_state)
         if data:
             self._learned_poll_paths = sorted(data.keys())
-            self.log_message.emit(
-                f"Capture complete -- {len(data)} parameters stored")
+            self.log_message.emit(f"Capture complete -- {len(data)} parameters stored")
         else:
             self.log_message.emit(
-                "Capture: 0 parameters -- Wing did not respond. "
-                "Check that Wing is on and IP is correct.")
-
+                "Capture: 0 parameters known yet -- wait for sync to finish and try again.")
         self.capture_done.emit(data, getattr(self, "_capture_target_idx", -1))
+
+    def _start_capture_tcp(self):
+        """Kept for backward compatibility -- now just calls start_capture(),
+        which reads directly from _wing_state (see start_capture's
+        docstring for why the old GET-based approach never worked)."""
+        self.start_capture()
+
+    def _finish_capture(self):
+        """No longer used -- start_capture() completes synchronously now,
+        there's nothing to finish later. Kept only in case any old code
+        path still references it."""
+        pass
 
     # ── Recall ────────────────────────────────────────────────────────────────
 
