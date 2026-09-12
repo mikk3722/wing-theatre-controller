@@ -3936,7 +3936,7 @@ class CueListPanel(QWidget):
         self.cancel_fade_btn.setStyleSheet(
             f"QPushButton {{ background:{C['bg2']}; color:{C['text2']}; border:1px solid {C['border']}; "
             f"border-radius:4px; font-size:11px; }} "
-            f"QPushButton:hover {{ background:{C['bg1']}; color:{C['text1']}; }}")
+            f"QPushButton:hover {{ background:{C['bg4']}; color:{C['text']}; }}")
         self.cancel_fade_btn.clicked.connect(self.cancel_fade_pressed.emit)
         go_row.addWidget(self.go_btn, 1)
         go_row.addWidget(self.cancel_fade_btn, 0)
