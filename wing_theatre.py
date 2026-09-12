@@ -3225,6 +3225,7 @@ class RecallScopeWidget(QWidget):
             new_circ = CIRCLE_ON if new_val else CIRCLE_OFF
             ch_keys  = data.get("children", [])
             global_val = self.snapshot.scope.get(sk, True)
+            sends_channels = set()
             for ck in ch_keys:
                 if ck.startswith("dca_") and sk not in DCA_APPLICABLE:
                     continue
@@ -3239,7 +3240,15 @@ class RecallScopeWidget(QWidget):
                     # override -- not just the fallback flag those defer to.
                     for dest in SEND_DEST_KEYS:
                         cs.send_overrides[dest] = new_val
+                    sends_channels.add(ck)
             item.setData(col, CIRCLE_ROLE, new_circ)
+            if sk == 'sends' and sends_channels:
+                # Also update the visible circles for every expanded
+                # per-bus/matrix sub-column -- otherwise the data is
+                # correct but the columns you can actually see stay stale
+                # until something else forces a rebuild.
+                for i in range(len(SEND_DEST_KEYS)):
+                    item.setData(SEND_FIRST_COL + i, CIRCLE_ROLE, new_circ)
             for i in range(item.childCount()):
                 child = item.child(i)
                 child_data = child.data(LABEL_COL, Qt.ItemDataRole.UserRole)
@@ -3247,6 +3256,9 @@ class RecallScopeWidget(QWidget):
                 if ck.startswith("dca_") and sk not in DCA_APPLICABLE:
                     continue
                 child.setData(col, CIRCLE_ROLE, new_circ)
+                if sk == 'sends' and ck in sends_channels:
+                    for i2 in range(len(SEND_DEST_KEYS)):
+                        child.setData(SEND_FIRST_COL + i2, CIRCLE_ROLE, new_circ)
 
         elif data["type"] == "channel":
             ck = data["key"]
@@ -3259,10 +3271,13 @@ class RecallScopeWidget(QWidget):
                 cs.overrides[sk] = new_val
             else:
                 cs.overrides.pop(sk, None)
+            new_circ_ch = CIRCLE_ON if new_val else CIRCLE_OFF
             if sk == 'sends' and (ck.startswith('input_') or ck.startswith('bus_')):
                 for dest in SEND_DEST_KEYS:
                     cs.send_overrides[dest] = new_val
-            item.setData(col, CIRCLE_ROLE, CIRCLE_ON if new_val else CIRCLE_OFF)
+                for i in range(len(SEND_DEST_KEYS)):
+                    item.setData(SEND_FIRST_COL + i, CIRCLE_ROLE, new_circ_ch)
+            item.setData(col, CIRCLE_ROLE, new_circ_ch)
             self._refresh_group_col(item, col, sk)
 
         self.tree.viewport().update()
