@@ -32,7 +32,7 @@ from PyQt6.QtWidgets import (
     QMessageBox, QInputDialog, QStatusBar, QToolBar, QSizePolicy,
     QTableWidget, QTableWidgetItem, QHeaderView, QGroupBox,
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QTreeWidget, QTreeWidgetItem, QStyledItemDelegate, QStyleOptionViewItem,
+    QTreeWidget, QTreeWidgetItem, QTreeView, QStyledItemDelegate, QStyleOptionViewItem,
     QCompleter, QMenu, QStyle, QFrame
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QSize, QRect, QEvent, QStringListModel
@@ -2928,6 +2928,73 @@ class RecallScopeWidget(QWidget):
         self.tree.itemClicked.connect(self._on_item_clicked)
         self.tree.itemChanged.connect(self._on_fade_edited)
 
+        # ── Frozen-column overlay ────────────────────────────────────────
+        # Path/expand/xFade stay pinned on screen while scrolling right
+        # through the scope columns, so it's always clear which channel a
+        # given circle belongs to. Standard Qt technique: a second QTreeView
+        # sharing the SAME model and selection as the main tree, showing
+        # only the frozen columns, geometrically overlaid on the left edge
+        # and synced vertically -- never scrolled horizontally itself.
+        self.tree_frozen = QTreeView(self.tree)
+        self.tree_frozen.setModel(self.tree.model())
+        self.tree_frozen.setSelectionModel(self.tree.selectionModel())
+        self.tree_frozen.setItemDelegate(self._delegate)
+        self.tree_frozen.setIndentation(0)
+        self.tree_frozen.setRootIsDecorated(False)
+        self.tree_frozen.setUniformRowHeights(True)
+        self.tree_frozen.setAlternatingRowColors(True)
+        self.tree_frozen.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.tree_frozen.setStyleSheet(f"""
+            QTreeView {{
+                background: {C['bg']}; color: {C['text']};
+                border: none; border-right: 1px solid {C['border2']};
+                outline: none;
+                alternate-background-color: {C['bg2']};
+                show-decoration-selected: 1;
+            }}
+            QTreeView::item {{
+                padding: 2px 4px;
+                border-bottom: 1px solid #1e1e1e;
+                min-height: 28px;
+            }}
+            QTreeView::item:selected {{ background: {C['active_cue']}; color: {C['text']}; }}
+            QTreeView::item:hover {{ background: {C['bg3']}; }}
+            QTreeView::branch {{ background: {C['bg']}; }}
+        """)
+        self.tree_frozen.header().setSectionsClickable(True)
+        self.tree_frozen.header().sectionClicked.connect(self._on_header_clicked)
+        self.tree_frozen.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked |
+            QAbstractItemView.EditTrigger.EditKeyPressed)
+        self.tree_frozen.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.tree_frozen.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        for i in range(TOTAL_COLS):
+            self.tree_frozen.setColumnHidden(i, i not in (LABEL_COL, EXPAND_COL, FADE_F_COL, FADE_S_COL))
+        for i in range(SEND_FIRST_COL, SEND_TOTAL_COLS):
+            self.tree_frozen.setColumnHidden(i, True)
+        for c in (LABEL_COL, EXPAND_COL, FADE_F_COL, FADE_S_COL):
+            self.tree_frozen.header().resizeSection(c, hdr.sectionSize(c))
+            self.tree_frozen.header().setSectionResizeMode(c, QHeaderView.ResizeMode.Fixed)
+        self.tree.verticalScrollBar().valueChanged.connect(
+            self.tree_frozen.verticalScrollBar().setValue)
+        self.tree_frozen.expanded.connect(lambda idx: self.tree.expand(idx))
+        self.tree_frozen.collapsed.connect(lambda idx: self.tree.collapse(idx))
+        self.tree.expanded.connect(lambda idx: self.tree_frozen.expand(idx))
+        self.tree.collapsed.connect(lambda idx: self.tree_frozen.collapse(idx))
+
+        def _frozen_clicked(index):
+            if index.column() == EXPAND_COL:
+                self.tree_frozen.setExpanded(index, not self.tree_frozen.isExpanded(index))
+        self.tree_frozen.clicked.connect(_frozen_clicked)
+
+        def _resize_frozen():
+            width = sum(hdr.sectionSize(c) for c in (LABEL_COL, EXPAND_COL, FADE_F_COL, FADE_S_COL))
+            self.tree_frozen.setGeometry(0, 0, width, self.tree.viewport().height() + hdr.height())
+        self._resize_frozen = _resize_frozen
+        self.tree.installEventFilter(self)
+        hdr.sectionResized.connect(lambda *_: _resize_frozen())
+        _resize_frozen()
+
         chan_layout.addWidget(self.tree)
 
         # Legend
@@ -2970,6 +3037,18 @@ class RecallScopeWidget(QWidget):
     def set_toolbar_visible(self, visible: bool):
         """Show or hide the top toolbar -- used by DefaultScopeDialog for a cleaner embed."""
         self._top_toolbar.setVisible(visible)
+
+    def eventFilter(self, obj, event):
+        """Watches self.tree for resize events so the frozen-column overlay
+        (Path/expand/xFade, pinned while scrolling right) always stays the
+        right size. installEventFilter is the correct way to observe
+        events on an existing widget instance in PyQt -- overriding
+        resizeEvent directly only works via a real subclass, not by
+        reassigning the instance attribute, since Qt dispatches virtual
+        events like this through the C++ side."""
+        if obj is self.tree and event.type() == QEvent.Type.Resize:
+            self._resize_frozen()
+        return super().eventFilter(obj, event)
 
     def load_snapshot(self, snap):
         self.snapshot = snap
