@@ -1655,6 +1655,16 @@ class WingOSC(QObject):
                     # itself originally chose for it.
                     with self._wing_state_lock:
                         self._wing_state[path] = value
+                    # Prime AU's baseline to this exact value too. Without
+                    # this, when Wing echoes back confirmation of the value
+                    # we just sent, AU compares it against whatever was
+                    # there BEFORE this recall (stale) and can mistake our
+                    # own recall for a fresh user change -- redundant at
+                    # best, and if the AU section mode is 'group'/'all' it
+                    # could re-propagate this value into OTHER cues that
+                    # were never touched. Same reasoning as the existing
+                    # fade-echo guard, just for instantly-recalled values.
+                    self._au_baseline[path] = value
                     is_pri = scope_key in ('mute', 'fader')
                     params.append((path, str(value), is_pri))
                     continue
@@ -1671,6 +1681,10 @@ class WingOSC(QObject):
                         except ValueError: pass
                 with self._wing_state_lock:
                     self._wing_state[path] = v
+                # Same reasoning as the hash-addressed branch above -- prime
+                # AU's baseline so Wing's confirmation echo of our own
+                # recall isn't mistaken for a fresh user-driven change.
+                self._au_baseline[path] = v
                 if isinstance(v, float):
                     vstr = f"{v:.6g}"
                     # Ensure decimal so wingmon uses set_float not set_int
@@ -2983,8 +2997,17 @@ class RecallScopeWidget(QWidget):
         self.tree.collapsed.connect(lambda idx: self.tree_frozen.collapse(idx))
 
         def _frozen_clicked(index):
-            if index.column() == EXPAND_COL:
-                self.tree_frozen.setExpanded(index, not self.tree_frozen.isExpanded(index))
+            if index.column() != EXPAND_COL:
+                return
+            # Use self.tree's own item as the single source of truth for
+            # expand/collapse state -- checking tree_frozen's own state
+            # here could drift out of sync with the main tree over time
+            # (e.g. after a rebuild), which is exactly what made collapse
+            # stop working after an expand.
+            item = self.tree.itemFromIndex(index)
+            if item:
+                item.setExpanded(not item.isExpanded())
+                self._update_expand_buttons()
         self.tree_frozen.clicked.connect(_frozen_clicked)
 
         def _resize_frozen():
