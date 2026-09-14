@@ -2918,9 +2918,15 @@ class RecallScopeWidget(QWidget):
 
         hdr.setSectionsClickable(True)
         hdr.sectionClicked.connect(self._on_header_clicked)
-        # itemClicked handles circle toggles; itemChanged handles fade text edits
+        # itemClicked handles circle toggles.
         self.tree.itemClicked.connect(self._on_item_clicked)
-        self.tree.itemChanged.connect(self._on_fade_edited)
+        # Fade text edits: connect at the MODEL level, not itemChanged.
+        # itemChanged is a QTreeWidget-specific signal; the frozen overlay
+        # below is a plain QTreeView sharing this same model, and editing
+        # a fade time through IT would not reliably fire self.tree's own
+        # itemChanged. dataChanged is a model-level signal that fires
+        # identically no matter which view committed the edit.
+        self.tree.model().dataChanged.connect(self._on_fade_data_changed)
 
         # ── Frozen-column overlay ────────────────────────────────────────
         # Path/expand/xFade stay pinned on screen while scrolling right
@@ -3433,6 +3439,20 @@ class RecallScopeWidget(QWidget):
         else:           circle = CIRCLE_OFF
         parent.setData(col, CIRCLE_ROLE, circle)
 
+    def _on_fade_data_changed(self, top_left, bottom_right, roles):
+        """Adapter: dataChanged is a model-level signal (fires no matter
+        which view -- main tree or frozen overlay -- committed the edit),
+        but _on_fade_edited's logic expects a QTreeWidgetItem/column like
+        the old itemChanged signal gave it. Resolve and delegate."""
+        if getattr(self, '_fade_edit_reentrant', False):
+            return   # this change was caused by _on_fade_edited itself (its own reformatting write) -- ignore
+        col = top_left.column()
+        if col not in (FADE_F_COL, FADE_S_COL) or top_left != bottom_right:
+            return
+        item = self.tree.itemFromIndex(top_left)
+        if item:
+            self._on_fade_edited(item, col)
+
     def _on_fade_edited(self, item, col):
         """Handle edits to the Fader/Sends fade time columns."""
         if col not in (FADE_F_COL, FADE_S_COL) or not self.snapshot:
@@ -3440,10 +3460,21 @@ class RecallScopeWidget(QWidget):
         data = item.data(LABEL_COL, Qt.ItemDataRole.UserRole)
         if not data:
             return
+        raw = item.text(col).strip()
         try:
-            val = max(0.0, float(item.text(col)))
+            # Accept a comma as the decimal separator too (Danish/European
+            # convention) -- Python's float() only accepts a period, so
+            # "20,0" would otherwise raise, get silently caught below, and
+            # reset to 0.0 with no indication anything went wrong.
+            val = max(0.0, float(raw.replace(',', '.'))) if raw else 0.0
         except (ValueError, TypeError):
             val = 0.0
+            if raw:
+                win = self.window()
+                if win and hasattr(win, 'statusBar'):
+                    win.statusBar().showMessage(
+                        f"Could not read '{raw}' as a fade time -- use e.g. 20 or 20.0. Reset to 0 (inherit from group).",
+                        5000)
 
         param = "fader" if col == FADE_F_COL else "sends"
 
@@ -3456,12 +3487,16 @@ class RecallScopeWidget(QWidget):
             else:
                 cs.sends_fade = val
 
-        # Reformat to exactly 1 decimal place (e.g. "4" -> "4.0")
+        # Reformat to exactly 1 decimal place (e.g. "4" -> "4.0"). This
+        # itself writes to the model, which would normally re-trigger
+        # _on_fade_data_changed -- guard against that recursion.
+        self._fade_edit_reentrant = True
         self.tree.blockSignals(True)
         # Groups always show 0.0; channels show blank when zero (= inherit from group)
         is_group = data["type"] == "group"
         item.setText(col, f"{val:.1f}" if val > 0 or is_group else "")
         self.tree.blockSignals(False)
+        self._fade_edit_reentrant = False
         self.scope_changed.emit()
 
     def _refresh_sends_aggregate(self, item):
