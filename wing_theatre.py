@@ -1530,20 +1530,6 @@ class WingOSC(QObject):
 
     # ── TCP Capture (replaces OSC polling when wingmon available) ─────────────
 
-    # Top-level nodes to GET -- one request per node, Wing returns all children.
-    # This replaces the old POLL_PARAMS list and captures MORE parameters.
-    @property
-    def CAPTURE_NODES(self):
-        """Individual node paths -- libwing requires specific channel IDs, not root nodes."""
-        return (
-            [f'/ch/{i}'   for i in range(1, 49)] +
-            [f'/bus/{i}'  for i in range(1, 17)] +
-            [f'/main/{i}' for i in range(1,  5)] +
-            [f'/mtx/{i}'  for i in range(1,  9)] +
-            [f'/dca/{i}'  for i in range(1, 17)] +
-            [f'/fx/{i}'   for i in range(1, 17)]
-        )
-
     def start_capture(self, duration_ms=12000):
         """
         Capture current Wing parameters into the target cue.
@@ -1574,12 +1560,6 @@ class WingOSC(QObject):
             self.log_message.emit(
                 "Capture: 0 parameters known yet -- wait for sync to finish and try again.")
         self.capture_done.emit(data, getattr(self, "_capture_target_idx", -1))
-
-    def _start_capture_tcp(self):
-        """Kept for backward compatibility -- now just calls start_capture(),
-        which reads directly from _wing_state (see start_capture's
-        docstring for why the old GET-based approach never worked)."""
-        self.start_capture()
 
     def _finish_capture(self):
         """No longer used -- start_capture() completes synchronously now,
