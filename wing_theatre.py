@@ -708,6 +708,7 @@ class WingOSC(QObject):
     connection_ready   = pyqtSignal()   # emitted on main thread after connect
     capture_finished   = pyqtSignal()   # emitted from wingmon thread -> finish on main
     sync_complete      = pyqtSignal(int)   # initial state sync done (param count)
+    fade_countdown     = pyqtSignal(object)  # seconds remaining (float) for the newest fade, or None when idle
     WING_PORT    = 2223
     WINGMON_PATH = _find_wingmon_path()
     PROPMAP_PATH   = _find_propmap_path()
@@ -1848,6 +1849,13 @@ class WingOSC(QObject):
     def _start_fade(self, path, start_db, end_db, fade_secs, fps=40):
         """Queue a fade -- interpolates linearly in dB space for smooth visual movement."""
         steps = max(2, int(fade_secs * fps))
+        # If a fade for this exact path is already running (e.g. this path
+        # got queued twice for some reason), replace it rather than
+        # stacking a second, independent job on top -- two jobs for the
+        # same path would both write to it every tick, sending redundant/
+        # conflicting values and needlessly inflating the size of every
+        # BATCH_SET burst for the rest of the fade.
+        self._fade_jobs = [j for j in self._fade_jobs if j[0] != path]
         self._fade_jobs.append([path, float(start_db), float(end_db), steps, 0])
         # Suppress Auto Update writes for this path until we actually see the
         # fade's real target value come back from Wing -- not just "some
@@ -1864,6 +1872,12 @@ class WingOSC(QObject):
             "target":   float(end_db),
             "deadline": _time.time() + fade_secs + SAFETY_MARGIN,
         }
+        # Track the newest (most recently started) fade's own finish time,
+        # for the Cancel fade button's countdown display -- always
+        # overwritten by whichever _start_fade call happens last, so it
+        # reflects "time left on the fade you just triggered", not
+        # necessarily whichever fade job happens to finish last overall.
+        self._newest_fade_end_time = _time.time() + fade_secs
         if not self._unified_timer.isActive():
             self._unified_timer.start(int(1000 / fps))
 
@@ -1937,6 +1951,18 @@ class WingOSC(QObject):
 
         if not self._fade_jobs:
             self._unified_timer.stop()
+            self._newest_fade_end_time = None
+            self.fade_countdown.emit(None)
+        else:
+            import time as _time
+            remaining = max(0.0, getattr(self, '_newest_fade_end_time', 0) - _time.time())
+            # Only emit when the displayed whole second actually changes --
+            # updating a button's text 40x/sec for a once-a-second display
+            # would just be wasted UI churn.
+            shown = int(remaining) + (1 if remaining % 1 > 0 else 0)
+            if shown != getattr(self, '_last_countdown_shown', -1):
+                self._last_countdown_shown = shown
+                self.fade_countdown.emit(remaining)
 
     def _send_params_batch(self, pairs):
         """Send multiple (path, value) pairs to Wing in a single BATCH_SET,
@@ -1969,6 +1995,8 @@ class WingOSC(QObject):
             self._fading_paths.pop(job[0], None)
         self._unified_timer.stop()
         self._fade_jobs.clear()
+        self._newest_fade_end_time = None
+        self.fade_countdown.emit(None)
 
     def jump_fades_to_target(self):
         """Stop every active fade immediately and snap each of its
@@ -3417,6 +3445,28 @@ class RecallScopeWidget(QWidget):
         self.tree.viewport().update()
         self.scope_changed.emit()
 
+    def _refresh_group_col(self, child_item, col, sk):
+        """After a channel-level scope toggle, recompute the parent group's
+        aggregate circle for that same column."""
+        parent = child_item.parent()
+        if not parent:
+            return
+        data = parent.data(LABEL_COL, Qt.ItemDataRole.UserRole)
+        if not data:
+            return
+        global_val = self.snapshot.scope.get(sk, True)
+        # Read-only -- don't create channel scopes just for display
+        vals = [(self.snapshot.channel_scopes[ck].overrides.get(sk, global_val)
+                 if ck in self.snapshot.channel_scopes
+                 else global_val)
+                for ck in data.get("children", [])]
+        if not vals:
+            return
+        if all(vals):   circle = CIRCLE_ON
+        elif any(vals): circle = CIRCLE_PART
+        else:           circle = CIRCLE_OFF
+        parent.setData(col, CIRCLE_ROLE, circle)
+
     def _refresh_send_group_col(self, child_item, col, dest):
         """After a channel-level send toggle, recompute the parent group's
         aggregate circle for that same destination column."""
@@ -4062,7 +4112,7 @@ class CueListPanel(QWidget):
         self.go_btn = QPushButton("GO"); self.go_btn.setObjectName("go_btn")
         self.go_btn.setFixedHeight(52); self.go_btn.clicked.connect(self.go_pressed.emit)
         self.cancel_fade_btn = QPushButton("Cancel fade")
-        self.cancel_fade_btn.setFixedHeight(52); self.cancel_fade_btn.setFixedWidth(100)
+        self.cancel_fade_btn.setFixedHeight(52); self.cancel_fade_btn.setFixedWidth(120)
         self.cancel_fade_btn.setToolTip(
             "Stop any fades in progress right now and jump straight to their target values")
         self.cancel_fade_btn.setStyleSheet(
@@ -5496,6 +5546,7 @@ class MainWindow(QMainWindow):
         self.cue_panel.cue_selected.connect(self._on_cue_selected)
         self.cue_panel.go_pressed.connect(self._go)
         self.cue_panel.cancel_fade_pressed.connect(self.osc.jump_fades_to_target)
+        self.osc.fade_countdown.connect(self._on_fade_countdown)
         self.cue_panel.add_pressed.connect(self._add_snapshot)
         self.cue_panel.snap_reordered.connect(self._on_snaps_reordered)
         self.cue_panel.snap_duplicate.connect(self._on_snap_duplicate)
@@ -5534,6 +5585,16 @@ class MainWindow(QMainWindow):
         self.osc_server.log.connect(lambda m: self.status_bar.showMessage(m, 4000))
 
     # ── Dirty tracking & close ───────────────────────────────────────────────
+
+    def _on_fade_countdown(self, remaining):
+        """Update the Cancel fade button's label with time remaining on the
+        newest fade, e.g. 'Cancel fade (12s)'. remaining is None when no
+        fade is active."""
+        btn = self.cue_panel.cancel_fade_btn
+        if remaining is None:
+            btn.setText("Cancel fade")
+        else:
+            btn.setText(f"Cancel fade ({int(remaining) + 1}s)")
 
     def _mark_dirty(self):
         self._dirty = True
