@@ -327,7 +327,7 @@ DEFAULT_CHANNEL_SCOPES = {}   # channel_key -> ChannelScope
 AU_PARAMS = [(key, f"{short}  --  {tip}") for key, short, tip in WING_SCOPE_COLS] + [
     ("fx_rack", "FX Racks  --  Global FX Rack Effects (Rack 1–16)"),
 ]
-AU_STATES = ["snap", "group", "all"]   # 3 column values
+AU_STATES = ["none", "snap", "group", "all"]   # 4 column values
 
 SECTION_COLORS = ["#52b788","#e76f51","#4895ef","#f4a261","#c77dff","#ff6b6b"]
 
@@ -4657,9 +4657,9 @@ class SectionsPanel(QWidget):
 
         excl_grp = QGroupBox("AUTO-UPDATE EXCLUSIONS  --  where are changes written?")
         excl_l = QVBoxLayout(excl_grp)
-        self.excl_table = QTableWidget(len(AU_PARAMS), 3)
+        self.excl_table = QTableWidget(len(AU_PARAMS), 4)
         self.excl_table.setHorizontalHeaderLabels(
-            ["Current Snapshot", "Current Group", "All Snapshots"])
+            ["No Snapshots", "Current Snapshot", "Current Group", "All Snapshots"])
         self.excl_table.setVerticalHeaderLabels([lbl for _,lbl in AU_PARAMS])
         self.excl_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         _ROW_H = 26
@@ -4673,6 +4673,8 @@ class SectionsPanel(QWidget):
         excl_l.addWidget(self.excl_table)
         excl_grp.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         hint = QLabel(
+            "'No Snapshots' -- Auto Update tracks the live value but never writes it to any "
+            "cue. Whatever is already programmed stays exactly as-is; nothing new is captured.\n"
             "Parameters set to 'Current Snapshot' only change the active cue (like a DiGiCo exclusion).\n"
             "'Current Group' writes to all snapshots in the same cue group -- "
             "if the active snapshot has no group, it falls back to 'Current Snapshot' behaviour.\n"
@@ -4801,9 +4803,6 @@ class SectionsPanel(QWidget):
         if self.current_idx < 0: return
         key = AU_PARAMS[row][0]
         self.show.sections[self.current_idx].exclusions[key] = AU_STATES[col]
-        self._refresh_excl(self.show.sections[self.current_idx])
-        self.sections_changed.emit()
-
         self._refresh_excl(self.show.sections[self.current_idx])
         self.sections_changed.emit()
 
@@ -6413,6 +6412,13 @@ class MainWindow(QMainWindow):
                     return
             else:
                 mode = 'snap'
+
+        if mode == 'none':
+            # Tracked live (baseline/state still update as normal), but
+            # deliberately never written into any cue -- whatever's already
+            # programmed for this parameter stays exactly as-is. No need
+            # for an active cue at all, since nothing gets written regardless.
+            return
 
         active_idx = self.cue_panel.active_index
         if active_idx < 0 or active_idx >= len(self.show_file.snapshots):
