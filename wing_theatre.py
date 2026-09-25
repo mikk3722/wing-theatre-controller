@@ -256,6 +256,19 @@ SCOPE_PATH_GROUPS = [
 # Scope keys applicable to DCA groups (no EQ, dynamics, inserts, sends, filter, input)
 DCA_APPLICABLE = {"fader", "mute", "custom"}
 
+# Scope-tree row key -> the console's name path, e.g. input_01 -> /ch/1/name,
+# matrix_02 -> /mtx/2/name. Used to show "Input Ch 01 (BD)" style labels.
+_CH_KEY_NAME_KIND = {"input": "ch", "bus": "bus", "matrix": "mtx", "main": "main", "dca": "dca"}
+
+def _ch_key_to_name_path(ch_key):
+    kind, _, num = (ch_key or "").rpartition('_')
+    wk = _CH_KEY_NAME_KIND.get(kind)
+    try:
+        n = int(num)
+    except ValueError:
+        return None
+    return f"/{wk}/{n}/name" if wk else None
+
 # FX slots -- simple single on/off per slot (stored in snapshot.fx_scope)
 FX_SLOTS = [(f"fx_{i+1:02d}", f"FX Slot {i+1:02d}") for i in range(16)]
 
@@ -732,6 +745,7 @@ class WingOSC(QObject):
     connection_ready   = pyqtSignal()   # emitted on main thread after connect
     capture_finished   = pyqtSignal()   # emitted from wingmon thread -> finish on main
     sync_complete      = pyqtSignal(int)   # initial state sync done (param count)
+    name_changed       = pyqtSignal(str, str)   # (ch_key, name) -- a channel/bus/mtx/main/dca name changed on the console
     fade_countdown     = pyqtSignal(object)  # seconds remaining (float) for the newest fade, or None when idle
     WING_PORT    = 2223
     WINGMON_PATH = _find_wingmon_path()
@@ -799,6 +813,11 @@ class WingOSC(QObject):
         self.port           = self.WING_PORT
         self.local_ip       = "0.0.0.0"   # set on connect
         self.is_connected   = False
+        # True only once wingmon's initial full SYNC has completed for the
+        # CURRENT connection. Actions that read or write the console state
+        # (GO, Recall, Update from Wing, Add Snap) require this, not just
+        # is_connected -- mid-sync, _wing_state is only partially filled.
+        self.synced         = False
         self._wing_state    = {}
         # _wing_state is written from the wingmon background thread (every
         # live event) and iterated/copied from the main thread (Add Snap,
@@ -1020,6 +1039,7 @@ class WingOSC(QObject):
 
     def disconnect(self):
         self.is_connected = False
+        self.synced = False
         self._stop_wingmon()
         for t in [getattr(self, '_au_report_timer', None),
                   getattr(self, '_capture_timer', None),
@@ -1223,6 +1243,7 @@ class WingOSC(QObject):
                 # ── Check for connection confirmation ─────────────────────────
                 if line == "Connected!":
                     self.is_connected = True
+                    self.synced = False   # fresh connection -- wait for this sync
                     self.connected.emit(True)   # ← enables Disconnect button immediately
                     self.log_message.emit(
                         f"Connected to Wing at {self.ip} -- syncing state…")
@@ -1240,6 +1261,7 @@ class WingOSC(QObject):
                 if line.startswith("SYNC_COMPLETE"):
                     parts = line.split()
                     n = int(parts[1]) if len(parts) > 1 else len(self._wing_state)
+                    self.synced = True
                     self.sync_complete.emit(n)
                     continue
 
@@ -1486,6 +1508,7 @@ class WingOSC(QObject):
         except Exception:
             pass
         finally:
+            self.synced = False
             if self.is_connected:
                 self.is_connected = False
                 self.connected.emit(False)
@@ -1496,6 +1519,15 @@ class WingOSC(QObject):
         with self._wing_state_lock:
             self._wing_state[path] = value
         self._live_event_count = getattr(self, '_live_event_count', 0) + 1
+
+        # Channel/bus/matrix/main/DCA renamed on the console -> let the UI
+        # update the "Input Ch 01 (BD)" labels live. Exactly /kind/N/name,
+        # so nested names deeper in a path are never mistaken for it.
+        parts = path.split('/')
+        if len(parts) == 4 and parts[3] == 'name':
+            ck = self._path_to_ch_key(path)
+            if ck:
+                self.name_changed.emit(ck, "" if value is None else str(value))
 
         # Update title bar every 100 events so user can see events arriving
         if self._live_event_count % 100 == 1:
@@ -2853,6 +2885,10 @@ class RecallScopeWidget(QWidget):
         super().__init__()
         self.show     = show
         self.snapshot = None
+        # Live Wing (WingOSC), set by MainWindow -- used only to show console
+        # channel names next to row labels. None (e.g. Default Scope dialog)
+        # just falls back to names stored in the snapshot, or no name.
+        self.wing     = None
         self._build()
 
     # ── UI construction ───────────────────────────────────────────────────────
@@ -2947,7 +2983,7 @@ class RecallScopeWidget(QWidget):
         hdr = self.tree.header()
         hdr.setDefaultSectionSize(52)
         hdr.setMinimumSectionSize(40)
-        hdr.resizeSection(LABEL_COL,  180)
+        hdr.resizeSection(LABEL_COL,  230)   # room for 'Input Ch 01 (Kick In)'
         hdr.resizeSection(EXPAND_COL,  28)
         hdr.resizeSection(FADE_F_COL,  70)
         hdr.resizeSection(FADE_S_COL,  70)
@@ -3277,11 +3313,62 @@ class RecallScopeWidget(QWidget):
             item.setForeground(FADE_S_COL, QColor(C['text2']))
         return item
 
+    def _channel_name(self, ch_key):
+        """Console name for a row, e.g. 'BD'. Prefers the live Wing state
+        while connected (so renames on the console show immediately);
+        otherwise the name stored in the loaded cue, so offline editing of
+        an old show still shows names."""
+        path = _ch_key_to_name_path(ch_key)
+        if not path:
+            return ""
+        name = None
+        wing = self.wing
+        live_known = False
+        if wing is not None and getattr(wing, 'is_connected', False):
+            with wing._wing_state_lock:
+                if path in wing._wing_state:
+                    live_known = True
+                    name = wing._wing_state.get(path)
+        # Fall back to the cue's stored name only if the console hasn't told
+        # us this name -- if it has (even as empty, i.e. cleared on the
+        # console), that live value wins, so a stale stored name never shows.
+        if not live_known and self.snapshot is not None:
+            name = self.snapshot.data.get(path)
+        return str(name).strip() if name not in (None, "") else ""
+
+    def _apply_channel_label(self, item, label, ch_key):
+        name = self._channel_name(ch_key)
+        text = f"{label} ({name})" if name else label
+        item.setText(LABEL_COL, "    " + text)
+        item.setToolTip(LABEL_COL, text)   # full text if the column elides it
+
+    def refresh_channel_names(self, ch_key=None):
+        """Re-apply 'Input Ch 01 (BD)' labels -- one row (live rename on the
+        console) or all rows (after sync / connection change). Signals are
+        blocked so this is never mistaken for a user edit."""
+        if not self.snapshot:
+            return
+        self.tree.blockSignals(True)
+        try:
+            for i in range(self.tree.topLevelItemCount()):
+                grp = self.tree.topLevelItem(i)
+                for j in range(grp.childCount()):
+                    child = grp.child(j)
+                    d = child.data(LABEL_COL, Qt.ItemDataRole.UserRole)
+                    if not d or (ch_key and d.get("key") != ch_key):
+                        continue
+                    self._apply_channel_label(child, d.get("label", ""), d.get("key", ""))
+        finally:
+            self.tree.blockSignals(False)
+        self.tree.viewport().update()
+        if hasattr(self, 'tree_frozen'):
+            self.tree_frozen.viewport().update()
+
     def _make_child_item(self, label, ch_key):
         item = QTreeWidgetItem()
         item.setData(LABEL_COL, Qt.ItemDataRole.UserRole,
-                     {"type": "channel", "key": ch_key})
-        item.setText(LABEL_COL, "    " + label)
+                     {"type": "channel", "key": ch_key, "label": label})
+        self._apply_channel_label(item, label, ch_key)
         item.setForeground(LABEL_COL, QColor(C['text']))
         item.setText(EXPAND_COL, "")
         item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
@@ -4284,6 +4371,14 @@ class CueListPanel(QWidget):
 
     # ── Active cue marker (last GOed) ────────────────────────────────────────
 
+    def set_wing_ready(self, ready: bool):
+        """GO and Add Snap need a connected, synced Wing -- grey them out
+        otherwise so it's visible up front (MainWindow also refuses them)."""
+        tip = "" if ready else "Connect to a Behringer Wing (and wait for sync) first"
+        for b in (self.go_btn, self.add_snap_btn):
+            b.setEnabled(ready)
+            b.setToolTip(tip)
+
     def mark_active(self, snap_idx):
         """Mark the most recently GOed cue green+bold; all others white."""
         self.active_index = snap_idx
@@ -4621,9 +4716,19 @@ class SnapshotDetailPanel(QWidget):
 
     def _set_enabled(self, e):
         for w in [self.name_edit, self.notes_edit, self.group_tags,
-                  self.capture_btn, self.recall_btn, self.delete_btn, self.scope_widget]:
+                  self.delete_btn, self.scope_widget]:
             w.setEnabled(e)
+        # Update from / Recall to Wing additionally need a connected,
+        # synced Wing -- both conditions must hold.
+        ready = getattr(self, '_wing_ready_flag', False)
+        for w in (self.capture_btn, self.recall_btn):
+            w.setEnabled(e and ready)
+            w.setToolTip("" if ready else "Connect to a Behringer Wing (and wait for sync) first")
         self.empty_lbl.setVisible(not e)
+
+    def set_wing_ready(self, ready: bool):
+        self._wing_ready_flag = ready
+        self._set_enabled(self.current_snapshot is not None)
 
     def load_snapshot(self, snap):
         self.current_snapshot = snap
@@ -5467,6 +5572,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self._setup_ui(); self._connect_signals(); self._new_show()
+        self._update_wing_actions()   # start locked until a Wing is connected + synced
         # Wire OscServer to settings panel so Start/Stop buttons work
         self.osc_settings_panel.set_osc_server(self.osc_server)
 
@@ -5582,6 +5688,17 @@ class MainWindow(QMainWindow):
         self.osc.connected.connect(lambda c: self.conn_panel.set_connected(c, self.osc.ip))
         self.osc.connected.connect(self._on_connected)
         self.osc.sync_complete.connect(self._on_sync_complete)
+        # Keep console-dependent buttons (GO, Add Snap, Update from/Recall
+        # to Wing) in step with connection + sync state.
+        self.osc.connected.connect(self._update_wing_actions)
+        self.osc.sync_complete.connect(self._update_wing_actions)
+        self.osc.connection_lost.connect(self._update_wing_actions)
+        # Console channel names shown in Recall Scope, e.g. "Input Ch 01 (BD)".
+        # name_changed is emitted from the wingmon reader thread -> queue it
+        # onto the main thread, same as parameter_received.
+        self.detail_panel.scope_widget.wing = self.osc
+        self.osc.name_changed.connect(
+            self._on_wing_name_changed, Qt.ConnectionType.QueuedConnection)
         self.osc.log_message.connect(self.status_bar.showMessage)
         self.osc.log_message.connect(self._log_to_file)
         self.osc.capture_done.connect(self._on_capture_done)
@@ -5907,9 +6024,7 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage(f"Saved as: {path}")
 
     def _add_snapshot(self):
-        if not self.osc.is_connected:
-            self.status_bar.showMessage(
-                "Not connected to Wing — connect first before adding snapshots", 4000)
+        if not self._wing_ready("Add Snap"):
             return
         if not self.osc._wing_state:
             self.status_bar.showMessage(
@@ -6306,13 +6421,54 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(
             f"OSC: '{snap_name}' created with {len(snap.data)} parameters", 4000)
 
+    def _wing_ready(self, action):
+        """Gate for every action that reads or writes the console (GO,
+        Recall to Wing, Update from Wing, Add Snap -- incl. GO triggered via
+        Companion/OSC/Space, which all route through _go). Requires a live
+        wingmon connection AND a completed sync for this connection.
+        Editing a loaded show offline (Recall Scope, sections, OSC setup,
+        names, notes, deleting/duplicating cues) is deliberately NOT gated."""
+        osc = self.osc
+        if not osc.is_connected or not osc._wingmon_running_ok():
+            reason = "not connected to a Behringer Wing"
+        elif not getattr(osc, 'synced', False):
+            reason = "still syncing with the Wing -- wait a moment"
+        else:
+            return True
+        self.status_bar.showMessage(f"⚠ {action} blocked -- {reason}", 5000)
+        return False
+
+    def _update_wing_actions(self, *_):
+        """Enable/disable the console-dependent buttons to match readiness,
+        so it's visible up front -- not only refused after clicking."""
+        osc = self.osc
+        ready = bool(osc.is_connected and getattr(osc, 'synced', False))
+        self.cue_panel.set_wing_ready(ready)
+        self.detail_panel.set_wing_ready(ready)
+        # Connection/sync changed -> names now come from the live console
+        # (or, offline, from the cue's stored data) -- refresh all labels.
+        self.detail_panel.scope_widget.refresh_channel_names()
+
+    def _on_wing_name_changed(self, ch_key, name):
+        """A channel was renamed on the console -- update its label live."""
+        try:
+            self.detail_panel.scope_widget.refresh_channel_names(ch_key)
+        except Exception:
+            import traceback; traceback.print_exc()
+
     def _go(self):
         idx = self.cue_panel.current_index
         if idx < 0 or idx >= len(self.show_file.snapshots): return
+        # Block GO completely when the Wing isn't ready -- previously GO
+        # still marked the cue active, fired its OSC messages and advanced
+        # to the next cue without anything reaching the console, leaving
+        # the program and the console out of step.
+        if not self._wing_ready("GO"):
+            return
         snap = self.show_file.snapshots[idx]
         self.cue_panel.mark_active(idx); self.active_cue_index = idx
         self.status_bar.showMessage(f"▶  GO: {snap.number:03d}  {snap.name}")
-        if self.osc.is_connected: self._recall_to_wing(snap)
+        self._recall_to_wing(snap)
         # Send per-snapshot OSC messages
         if snap.osc_messages:
             results = OscSender.send_messages(snap.osc_messages, self.show_file.osc_outputs)
@@ -6326,9 +6482,7 @@ class MainWindow(QMainWindow):
 
     def _capture(self):
         """Update from Wing -- copies current live state instantly."""
-        if not self.osc.is_connected:
-            self.status_bar.showMessage(
-                "Not connected -- cannot update from Wing", 4000)
+        if not self._wing_ready("Update from Wing"):
             return
         idx = self.cue_panel.current_index
         if idx < 0 or idx >= len(self.show_file.snapshots):
@@ -6388,10 +6542,21 @@ class MainWindow(QMainWindow):
             f"✓ Wing connected -- {param_count} parameters synced", 5000)
 
     def _on_sync_timeout(self):
-        """Sync didn't complete in time -- show error."""
-        self.status_bar.showMessage(
-            "⚠ Sync timeout -- Wing connected but state incomplete. "
-            "Try 'Update from Wing' manually.", 8000)
+        """Sync didn't confirm completion in time. If a substantial state
+        has nonetheless arrived, don't leave GO etc. locked for good --
+        being stuck mid-show would be worse than what the lock protects
+        against. Enable with a clear warning; otherwise stay locked."""
+        n = len(self.osc._wing_state)
+        if self.osc.is_connected and n >= 1000:
+            self.osc.synced = True
+            self._update_wing_actions()
+            self.status_bar.showMessage(
+                f"⚠ Sync not confirmed, but {n} parameters received -- actions enabled. "
+                f"Reconnect if anything looks wrong.", 10000)
+        else:
+            self.status_bar.showMessage(
+                "⚠ Sync timeout -- Wing state incomplete, GO/Update/Add are locked. "
+                "Disconnect and reconnect.", 10000)
 
     def _on_connection_lost(self):
         """Wing stopped responding -- show warning dialog."""
@@ -6600,9 +6765,9 @@ class MainWindow(QMainWindow):
     def _recall(self):
         idx = self.cue_panel.current_index
         if idx < 0 or idx >= len(self.show_file.snapshots): return
-        snap = self.show_file.snapshots[idx]
-        if self.osc.is_connected: self._recall_to_wing(snap)
-        else: self.status_bar.showMessage("Not connected -- recall simulated")
+        if not self._wing_ready("Recall to Wing"):
+            return
+        self._recall_to_wing(self.show_file.snapshots[idx])
 
     def _recall_to_wing(self, snapshot):
         n = len(snapshot.data)
