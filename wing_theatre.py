@@ -496,12 +496,36 @@ class ShowFile:
                 "app_settings": self.app_settings}
 
     def save(self, fp):
-        with open(fp,"w") as f: json.dump(self.to_dict(),f,indent=2)
+        """Atomic save. Previously this opened the target with "w", which
+        truncates the existing file IMMEDIATELY -- if anything failed
+        mid-write (an unserialisable value, disk full, app closed or power
+        lost during an autosave), the show file was left half-written or
+        empty. Now: serialise fully in memory first (so a serialisation
+        error never touches the disk), write to a temp file in the same
+        folder, flush + fsync, then os.replace() it over the original --
+        an atomic operation on macOS and Windows alike. The old file stays
+        fully intact until the new one is completely on disk."""
+        text = json.dumps(self.to_dict(), indent=2)
+        folder = os.path.dirname(os.path.abspath(fp))
+        tmp = os.path.join(folder, f".{os.path.basename(fp)}.saving.tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, fp)
+        except Exception:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+            raise
         self.filepath = fp
 
     @staticmethod
     def load(fp):
-        with open(fp) as f: d = json.load(f)
+        with open(fp, encoding="utf-8") as f: d = json.load(f)
         s = ShowFile()
         import os
         filename_name = os.path.splitext(os.path.basename(fp))[0]
@@ -896,7 +920,7 @@ class WingOSC(QObject):
         CHANNEL_SECTIONS = {"eq", "gate", "dyn", "flt"}
         FLOAT_TYPES = {"linear float", "log float"}
         try:
-            with open(self.PROPMAP_PATH) as f:
+            with open(self.PROPMAP_PATH, encoding='utf-8') as f:
                 for line in f:
                     try:
                         e = json.loads(line.strip())
@@ -936,6 +960,10 @@ class WingOSC(QObject):
         except FileNotFoundError:
             self.log_message.emit(
                 "propmap.jsonl not found -- wingmon props won't be fully resolved")
+        except Exception as e:
+            # Any other read problem must not stop wingmon from starting --
+            # hash-addressed recall doesn't depend on propmap at all.
+            self.log_message.emit(f"propmap.jsonl could not be read ({e}) -- continuing without it")
         return lookup, {'plain': float_plain, 'sectioned': float_sectioned}
 
     def _is_float_path(self, path):
@@ -1053,11 +1081,22 @@ class WingOSC(QObject):
             cmd = [self.WINGMON_PATH, '-h', self.ip]   # -h = direct TCP, no WiFi discovery
 
             # Hide console window on Windows
+            # encoding='utf-8' is essential: text=True alone uses the OS
+            # locale encoding, which is cp1252 on Windows -- but wingmon
+            # (Rust) always speaks UTF-8. Without this, recalling a cue
+            # containing e.g. a channel name with æ/ø/å (captured on a Mac)
+            # sends invalid UTF-8 to wingmon, whose stdin reader then stops
+            # for good -- no more commands of any kind reach Wing. The other
+            # direction could raise UnicodeDecodeError on some bytes (e.g.
+            # emoji in a channel name) and silently kill the reader thread,
+            # stopping all live updates. errors='replace' guarantees one odd
+            # byte can never take down either pipe.
             popen_kwargs = dict(
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True, bufsize=1, env=env)
+                text=True, encoding='utf-8', errors='replace',
+                bufsize=1, env=env)
             if sys.platform == 'win32':
                 popen_kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
 
@@ -3489,13 +3528,23 @@ class RecallScopeWidget(QWidget):
         else:           circle = CIRCLE_OFF
         parent.setData(col, CIRCLE_ROLE, circle)
 
-    def _on_fade_data_changed(self, top_left, bottom_right, roles):
+    def _on_fade_data_changed(self, top_left, bottom_right, roles=None):
         """Adapter: dataChanged is a model-level signal (fires no matter
         which view -- main tree or frozen overlay -- committed the edit),
         but _on_fade_edited's logic expects a QTreeWidgetItem/column like
         the old itemChanged signal gave it. Resolve and delegate."""
         if getattr(self, '_fade_edit_reentrant', False):
             return   # this change was caused by _on_fade_edited itself (its own reformatting write) -- ignore
+        # The code base uses self.tree.blockSignals(True) around its own
+        # programmatic tree updates. That used to suppress the old
+        # itemChanged handler, but it does NOT block the model's
+        # dataChanged -- so honour it explicitly, keeping the original
+        # "blocked = not a user edit" rule no matter how the tree is built.
+        if self.tree.signalsBlocked():
+            return
+        text_roles = {Qt.ItemDataRole.DisplayRole.value, Qt.ItemDataRole.EditRole.value}
+        if roles and not (text_roles & {int(r.value if hasattr(r, 'value') else r) for r in roles}):
+            return   # not a text change (e.g. colour/circle data) -- irrelevant here
         col = top_left.column()
         if col not in (FADE_F_COL, FADE_S_COL) or top_left != bottom_right:
             return
@@ -5319,7 +5368,7 @@ def _get_version():
         if base:
             p = os.path.join(base, 'version.txt')
             if os.path.exists(p):
-                try: return open(p).read().strip()
+                try: return open(p, encoding='utf-8').read().strip()
                 except: pass
     return "dev"
 
@@ -5639,7 +5688,15 @@ class MainWindow(QMainWindow):
             self._autosave_timer.start(mins * 60 * 1000)
 
     def _autosave(self):
-        if self.show_file.filepath and self._dirty:
+        if not self.show_file.filepath:
+            # A never-saved show has no file to autosave into. Previously
+            # this was skipped silently, which could look like autosave
+            # was working when it wasn't -- say so (status bar only).
+            if self._dirty:
+                self.status_bar.showMessage(
+                    "Autosave skipped -- save the show once (Save As) so autosave has a file to write to", 6000)
+            return
+        if self._dirty:
             try:
                 self._collect_app_settings()
                 self.show_file.save(self.show_file.filepath)
@@ -5701,6 +5758,36 @@ class MainWindow(QMainWindow):
                 "default_cfg_scope":     dict(DEFAULT_CFG_SCOPE),
                 "default_group_fades":   {k: dict(v) for k, v in DEFAULT_GROUP_FADES.items()},
             }
+            # Window size + position (Qt's own geometry blob, base64 so it
+            # fits in JSON). In LIVE mode use the geometry captured on
+            # entering live, so the normal edit-mode window is what's saved.
+            live = self.conn_panel.live_btn.isChecked()
+            geom = getattr(self, '_pre_live_geometry', None) if live else self.saveGeometry()
+            if geom is not None:
+                self.show_file.app_settings["window_geometry"] = \
+                    bytes(geom.toBase64()).decode("ascii")
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
+    def _restore_window_geometry(self, b64):
+        """Restore window size/position saved in the show file. Safety net:
+        a show saved on another computer, or with an external monitor that
+        isn't connected now, could otherwise put the window off-screen or
+        make it bigger than the current screen -- in that case clamp it to
+        the primary screen and centre it."""
+        try:
+            from PyQt6.QtCore import QByteArray
+            from PyQt6.QtGui import QGuiApplication
+            self.restoreGeometry(QByteArray.fromBase64(b64.encode("ascii")))
+            frame = self.frameGeometry()
+            on_screen = any(sc.availableGeometry().intersects(frame)
+                            for sc in QGuiApplication.screens())
+            if not on_screen:
+                avail = QGuiApplication.primaryScreen().availableGeometry()
+                self.resize(min(self.width(),  avail.width()),
+                            min(self.height(), avail.height()))
+                self.move(avail.center() - self.rect().center())
         except Exception:
             import traceback
             traceback.print_exc()
@@ -5733,6 +5820,9 @@ class MainWindow(QMainWindow):
 
             if "autosave_minutes" in s:
                 self._autosave_spin.setValue(int(s["autosave_minutes"]))
+
+            if s.get("window_geometry") and not self.conn_panel.live_btn.isChecked():
+                self._restore_window_geometry(s["window_geometry"])
 
             if "default_scope" in s:
                 DEFAULT_SCOPE.clear(); DEFAULT_SCOPE.update(s["default_scope"])
@@ -5787,7 +5877,13 @@ class MainWindow(QMainWindow):
     def _save_show(self):
         self._collect_app_settings()
         if self.show_file.filepath:
-            self.show_file.save(self.show_file.filepath)
+            try:
+                self.show_file.save(self.show_file.filepath)
+            except Exception as e:
+                QMessageBox.critical(self, "Save failed",
+                    f"Could not save:\n{self.show_file.filepath}\n\n{e}\n\n"
+                    f"The previous version of the file is untouched.")
+                return
             self._mark_clean()
             self.setWindowTitle(f"Wing Theatre Controller -- {self.show_file.name}")
             self.status_bar.showMessage(f"Saved: {self.show_file.filepath}")
@@ -5801,7 +5897,12 @@ class MainWindow(QMainWindow):
         if path:
             import os
             self.show_file.name = os.path.splitext(os.path.basename(path))[0]
-            self.show_file.save(path); self._mark_clean()
+            try:
+                self.show_file.save(path)
+            except Exception as e:
+                QMessageBox.critical(self, "Save failed", f"Could not save:\n{path}\n\n{e}")
+                return
+            self._mark_clean()
             self.setWindowTitle(f"Wing Theatre Controller -- {self.show_file.name}")
             self.status_bar.showMessage(f"Saved as: {path}")
 
@@ -5944,6 +6045,10 @@ class MainWindow(QMainWindow):
             # ── Enter Live Mode ───────────────────────────────────────────────
             self._pre_live_sizes = self._splitter.sizes()
             self._pre_live_size  = self.size()
+            # Full edit-mode geometry (size + position), so a save made
+            # while in LIVE mode stores the normal window, not the narrow
+            # 480px live window.
+            self._pre_live_geometry = self.saveGeometry()
 
             # Hide edit-only elements in connection panel
             self.conn_panel.set_live(True)
@@ -6351,6 +6456,35 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage(f"⚠ Auto Update error (ignored): {e}", 6000)
             print(tb)  # full traceback for diagnostics, if a console is attached
 
+    def _au_label(self, path, scope_key, ch_key):
+        """Human-readable name for an AU status message, e.g.
+        'Input Ch 05 · EQ' or 'Bus 03 · Sends (send MX1 lvl)'. Needed
+        because EQ/Gate/Dyn/Filter parameters are hash-addressed
+        (/ch/5/eq/#a1b2c3d4), which means nothing when read."""
+        maps = getattr(self, '_au_label_maps', None)
+        if maps is None:
+            ch_map = {ck: lbl for _, _, chs in SCOPE_PATH_GROUPS for ck, lbl in chs}
+            ch_map.update({k: lbl for k, lbl in FX_SLOTS})
+            sc_map = {k: short for k, short, _ in WING_SCOPE_COLS}
+            self._au_label_maps = maps = (ch_map, sc_map)
+        ch_map, sc_map = maps
+        parts = path.split('/')
+        leaf = parts[-1] if parts else path
+        if '/send/' in path and len(parts) >= 2:
+            detail = f" (send {parts[-2]} {leaf})"
+        elif leaf.startswith('#'):
+            detail = ""
+        else:
+            detail = f" ({leaf})"
+        return (f"{ch_map.get(ch_key, ch_key or path)} · "
+                f"{sc_map.get(scope_key, scope_key or '?')}{detail}")
+
+    @staticmethod
+    def _au_fmt(value):
+        if isinstance(value, float):
+            return f"{value:.3g}"
+        return str(value)
+
     def _on_parameter_received_impl(self, path, value):
         # Explicit AU guard -- should never be called with AU off
         if not self.osc._auto_update:
@@ -6372,6 +6506,18 @@ class MainWindow(QMainWindow):
         # to a slightly different step than requested).
         # _fade_jobs/_fading_paths live on self.osc (WingOSC), not on
         # MainWindow -- that's where _start_fade/_unified_step also live.
+        # Every exit below reports in the status bar what happened to this
+        # change -- saved (and where), or NOT saved and why -- so it's always
+        # visible what Auto Update is doing with each parameter you touch.
+        MSG_MS = 3000
+        scope_key = self.osc._path_to_scope_key(path)
+        ch_key    = self.osc._path_to_ch_key(path)
+        label     = self._au_label(path, scope_key, ch_key)
+        val_txt   = self._au_fmt(value)
+
+        def _not_saved(reason):
+            self.status_bar.showMessage(f"AU: {label} = {val_txt}  --  not saved: {reason}", MSG_MS)
+
         info = self.osc._fading_paths.get(path)
         if info is not None:
             import time as _time
@@ -6379,55 +6525,47 @@ class MainWindow(QMainWindow):
             if self.osc._approx_equal(value, info["target"]):
                 del self.osc._fading_paths[path]
                 self.status_bar.showMessage(
-                    f"AU: fade reached target for {path} -- resuming normal AU", 2000)
+                    f"AU: {label} -- fade reached target, Auto Update resumes for it", 2000)
                 return
             if now < info["deadline"]:
                 self.status_bar.showMessage(
-                    f"AU: suppressed {path} = {value} (mid-fade, target={info['target']:.3g})", 1500)
+                    f"AU: {label} = {val_txt}  --  ignored, cue fade in progress "
+                    f"(target {info['target']:.3g})", 1500)
                 return
             # Safety timeout -- give up waiting and process this as a real event
             del self.osc._fading_paths[path]
-            self.status_bar.showMessage(
-                f"AU: fade guard timed out for {path} -- resuming normal AU", 3000)
 
-        scope_key = self.osc._path_to_scope_key(path)
-        ch_key    = self.osc._path_to_ch_key(path)
         if not scope_key or not ch_key:
+            _not_saved("parameter isn't covered by any Recall Scope column")
             return
 
         # Determine write mode
         if not self.show_file.sections:
             # No sections defined -> AU is disabled until sections are configured
-            if not getattr(self, '_au_no_section_warned', False):
-                self._au_no_section_warned = True
-                self.status_bar.showMessage(
-                    'Auto Update: create a section first to enable per-cue writing', 5000)
+            _not_saved("no Auto-Update section exists yet (create one in Sections & Auto-Update)")
             return
+        section = self._get_active_section()
+        if section:
+            mode = section.exclusions.get(scope_key, 'snap')
+            if section.channels and ch_key not in section.channels:
+                _not_saved(f"channel isn't in the active section '{section.name}'")
+                return
         else:
-            self._au_no_section_warned = False
-            section = self._get_active_section()
-            if section:
-                mode = section.exclusions.get(scope_key, 'snap')
-                if section.channels and ch_key not in section.channels:
-                    return
-            else:
-                mode = 'snap'
+            mode = 'snap'
 
         if mode == 'none':
             # Tracked live (baseline/state still update as normal), but
             # deliberately never written into any cue -- whatever's already
             # programmed for this parameter stays exactly as-is. No need
             # for an active cue at all, since nothing gets written regardless.
+            sec_name = f" in section '{section.name}'" if section else ""
+            _not_saved(f"set to 'No Snapshots'{sec_name}")
             return
 
         active_idx = self.cue_panel.active_index
         if active_idx < 0 or active_idx >= len(self.show_file.snapshots):
-            if not getattr(self, '_au_no_cue_warned', False):
-                self._au_no_cue_warned = True
-                self.status_bar.showMessage(
-                    'Auto Update: press GO on a cue first to enable writing', 5000)
+            _not_saved("no active cue (press GO on a cue first)")
             return
-        self._au_no_cue_warned = False
 
         if mode == 'snap':
             targets = [active_idx]
@@ -6439,17 +6577,25 @@ class MainWindow(QMainWindow):
         else:  # 'all'
             targets = range(len(self.show_file.snapshots))
 
-        changed = False
+        written = []
         for idx in targets:
             snap = self.show_file.snapshots[idx]
             if self.osc._path_in_scope(path, snap):
                 snap.data[path] = value
-                changed = True
-        if changed:
-            if scope_key in ('fader', 'sends', 'eq', 'gate', 'dyn', 'flt'):
-                self.status_bar.showMessage(
-                    f"AU: wrote {path} = {value} to {len(targets)} cue(s)", 1500)
+                written.append(snap)
+        if written:
+            if len(written) == 1:
+                s = written[0]
+                try:    num = f"{int(s.number):03d}"
+                except (TypeError, ValueError): num = str(s.number)
+                where = f"cue {num} '{s.name}'"
+            else:
+                mode_txt = {"group": "current group", "all": "all snapshots"}.get(mode, mode)
+                where = f"{len(written)} cues ({mode_txt})"
+            self.status_bar.showMessage(f"AU: {label} = {val_txt}  --  saved to {where}", MSG_MS)
             self._mark_dirty()
+        else:
+            _not_saved("excluded from Recall Scope in the target cue(s)")
 
     def _recall(self):
         idx = self.cue_panel.current_index
