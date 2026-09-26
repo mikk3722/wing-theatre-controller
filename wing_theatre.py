@@ -269,6 +269,16 @@ def _ch_key_to_name_path(ch_key):
         return None
     return f"/{wk}/{n}/name" if wk else None
 
+
+def _snapshot_copy(state):
+    """Copy of the live Wing state for storing in a cue. Input-source nodes
+    (/io/...) are synced only so channel names can fall back to the source
+    name; nothing under /io is ever recalled (outside every Recall Scope
+    column), so only their names are kept -- no need to store preamp data
+    etc. in every single cue."""
+    return {p: v for p, v in state.items()
+            if not p.startswith('/io/') or p.endswith('/name')}
+
 # FX slots -- simple single on/off per slot (stored in snapshot.fx_scope)
 FX_SLOTS = [(f"fx_{i+1:02d}", f"FX Slot {i+1:02d}") for i in range(16)]
 
@@ -1351,9 +1361,16 @@ class WingOSC(QObject):
                                         self._wing_state[path] = value
                         continue
 
-                    if " = " not in rest:
+                    # Split on " =" (not " = "): the line was .strip()ped, so
+                    # an EMPTY value ("/ch/1/name = ") arrives as
+                    # "/ch/1/name =" with no trailing space. Splitting on
+                    # " = " dropped every empty value entirely -- so a
+                    # cleared name was never captured, never recalled, and a
+                    # stale one stayed visible. Paths never contain spaces,
+                    # so the first " =" is always the separator.
+                    if " =" not in rest:
                         continue
-                    path, val_str = rest.split(" = ", 1)
+                    path, val_str = rest.split(" =", 1)
                     path = path.strip(); val_str = val_str.strip()
                     if not path.startswith('/'):
                         continue
@@ -1528,6 +1545,16 @@ class WingOSC(QObject):
             ck = self._path_to_ch_key(path)
             if ck:
                 self.name_changed.emit(ck, "" if value is None else str(value))
+        elif len(parts) == 6 and parts[1] == 'io' and parts[2] == 'in' and parts[5] == 'name':
+            # An input SOURCE was renamed -- any channel patched to it (and
+            # without its own name) shows that name. Refresh all rows.
+            self.name_changed.emit("", "")
+        elif (len(parts) == 6 and parts[1] == 'ch' and parts[3] == 'in'
+              and parts[4] == 'conn' and parts[5] in ('grp', 'in')):
+            # Channel repatched to another source -> its shown name may change.
+            ck = self._path_to_ch_key(path)
+            if ck:
+                self.name_changed.emit(ck, "")
 
         # Update title bar every 100 events so user can see events arriving
         if self._live_event_count % 100 == 1:
@@ -1624,7 +1651,7 @@ class WingOSC(QObject):
                 "Capture unavailable -- wingmon is not running. Reconnect to Wing and try again.")
             return
         with self._wing_state_lock:
-            data = dict(self._wing_state)
+            data = _snapshot_copy(self._wing_state)
         if data:
             self._learned_poll_paths = sorted(data.keys())
             self.log_message.emit(f"Capture complete -- {len(data)} parameters stored")
@@ -2963,7 +2990,10 @@ class RecallScopeWidget(QWidget):
         self.tree = QTreeWidget()
         self.tree.setColumnCount(total_cols)
         self.tree.setAlternatingRowColors(True)
-        self.tree.setAnimated(True)
+        # Not animated: the frozen-column overlay can't animate in step with
+        # the main tree, so an animated expand briefly showed the two halves
+        # out of line (a 'double' look for ~a quarter second).
+        self.tree.setAnimated(False)
         self.tree.setIndentation(0)
         self.tree.setUniformRowHeights(True)
         self.tree.setRootIsDecorated(False)
@@ -3078,8 +3108,14 @@ class RecallScopeWidget(QWidget):
         for c in (LABEL_COL, EXPAND_COL, FADE_F_COL, FADE_S_COL):
             self.tree_frozen.header().resizeSection(c, hdr.sectionSize(c))
             self.tree_frozen.header().setSectionResizeMode(c, QHeaderView.ResizeMode.Fixed)
+        # Two-way vertical scroll sync: previously only main -> overlay, so
+        # scrolling the mouse wheel OVER the pinned columns scrolled only the
+        # overlay and left the rows misaligned. setValue on an unchanged
+        # value emits nothing, so this can't ping-pong.
         self.tree.verticalScrollBar().valueChanged.connect(
             self.tree_frozen.verticalScrollBar().setValue)
+        self.tree_frozen.verticalScrollBar().valueChanged.connect(
+            self.tree.verticalScrollBar().setValue)
         self.tree_frozen.expanded.connect(lambda idx: self.tree.expand(idx))
         self.tree_frozen.collapsed.connect(lambda idx: self.tree.collapse(idx))
         self.tree.expanded.connect(lambda idx: self.tree_frozen.expand(idx))
@@ -3101,7 +3137,14 @@ class RecallScopeWidget(QWidget):
 
         def _resize_frozen():
             width = sum(hdr.sectionSize(c) for c in (LABEL_COL, EXPAND_COL, FADE_F_COL, FADE_S_COL))
-            self.tree_frozen.setGeometry(0, 0, width, self.tree.viewport().height() + hdr.height())
+            # Same header height as the main tree -- if the two differed by
+            # even a couple of pixels, every row was offset vertically.
+            # sizeHint, not height(): height() can still be 0 / stale here
+            # (before the tree's first layout); the tree itself sizes its
+            # header from sizeHint, so this always matches.
+            self.tree_frozen.header().setFixedHeight(hdr.sizeHint().height())
+            fw = self.tree.frameWidth()
+            self.tree_frozen.setGeometry(fw, fw, width, self.tree.viewport().height() + hdr.sizeHint().height())
         self._resize_frozen = _resize_frozen
         self.tree.installEventFilter(self)
         hdr.sectionResized.connect(lambda *_: _resize_frozen())
@@ -3159,8 +3202,20 @@ class RecallScopeWidget(QWidget):
         reassigning the instance attribute, since Qt dispatches virtual
         events like this through the C++ side."""
         if obj is self.tree and event.type() == QEvent.Type.Resize:
-            self._resize_frozen()
+            # Deferred: event filters run BEFORE the tree handles its own
+            # resize, so the header/viewport sizes read now would be the
+            # old ones. singleShot(0) runs right after the tree has laid out.
+            QTimer.singleShot(0, self._resize_frozen_safe)
         return super().eventFilter(obj, event)
+
+    def _resize_frozen_safe(self):
+        """Deferred resize can fire after this widget was closed (e.g. the
+        Default Scope dialog, which embeds this same widget) -- then the
+        underlying Qt objects are gone; just skip."""
+        try:
+            self._resize_frozen()
+        except RuntimeError:
+            pass
 
     def load_snapshot(self, snap):
         self.snapshot = snap
@@ -3313,28 +3368,45 @@ class RecallScopeWidget(QWidget):
             item.setForeground(FADE_S_COL, QColor(C['text2']))
         return item
 
-    def _channel_name(self, ch_key):
-        """Console name for a row, e.g. 'BD'. Prefers the live Wing state
-        while connected (so renames on the console show immediately);
-        otherwise the name stored in the loaded cue, so offline editing of
-        an old show still shows names."""
-        path = _ch_key_to_name_path(ch_key)
-        if not path:
-            return ""
-        name = None
+    def _state_value(self, path):
+        """Value for a console path with the same precedence as the labels:
+        live Wing state while connected (even an empty value, i.e. cleared
+        on the console, wins -- never a stale stored one); otherwise the
+        value stored in the loaded cue, so offline editing still works."""
         wing = self.wing
-        live_known = False
         if wing is not None and getattr(wing, 'is_connected', False):
             with wing._wing_state_lock:
                 if path in wing._wing_state:
-                    live_known = True
-                    name = wing._wing_state.get(path)
-        # Fall back to the cue's stored name only if the console hasn't told
-        # us this name -- if it has (even as empty, i.e. cleared on the
-        # console), that live value wins, so a stale stored name never shows.
-        if not live_known and self.snapshot is not None:
-            name = self.snapshot.data.get(path)
-        return str(name).strip() if name not in (None, "") else ""
+                    return wing._wing_state.get(path)
+        if self.snapshot is not None:
+            return self.snapshot.data.get(path)
+        return None
+
+    def _channel_name(self, ch_key):
+        """Console name for a row, e.g. 'BD' -- the same name the Wing shows
+        on the strip: the channel's own name if it has one, otherwise (input
+        channels only) the name of the input SOURCE it is patched to, e.g.
+        /io/in/A/1/name. On the Wing, most channels are typically named on
+        the source, with the channel name left empty."""
+        path = _ch_key_to_name_path(ch_key)
+        if not path:
+            return ""
+        name = self._state_value(path)
+        if name not in (None, ""):
+            return str(name).strip()
+        if ch_key.startswith("input_"):
+            base = path[:-len("/name")]                 # /ch/N
+            grp  = self._state_value(f"{base}/in/conn/grp")
+            num  = self._state_value(f"{base}/in/conn/in")
+            if grp not in (None, "", "OFF") and num not in (None, ""):
+                try:
+                    num = int(num)
+                except (TypeError, ValueError):
+                    pass
+                src = self._state_value(f"/io/in/{grp}/{num}/name")
+                if src not in (None, ""):
+                    return str(src).strip()
+        return ""
 
     def _apply_channel_label(self, item, label, ch_key):
         name = self._channel_name(ch_key)
@@ -3437,6 +3509,27 @@ class RecallScopeWidget(QWidget):
         for i in range(self.tree.topLevelItemCount()):
             g = self.tree.topLevelItem(i)
             g.setText(EXPAND_COL, "▼" if g.isExpanded() else "▶")
+        self._sync_frozen_expansion()
+
+    def _sync_frozen_expansion(self):
+        """Force the frozen-column overlay's expand/collapse state to match
+        the main tree, row by row. The expanded/collapsed signal links are
+        not enough on their own: _rebuild re-expands groups while
+        self.tree's signals are BLOCKED, so the overlay never heard about
+        it -- the left (pinned) side showed collapsed groups while the
+        right side showed them expanded, so labels no longer lined up with
+        their circles (the intermittent 'double' look). This runs after
+        every expansion change, including rebuilds."""
+        frozen = getattr(self, 'tree_frozen', None)
+        if frozen is None:
+            return
+        model = self.tree.model()
+        for i in range(self.tree.topLevelItemCount()):
+            idx = model.index(i, 0)
+            want = self.tree.topLevelItem(i).isExpanded()
+            if frozen.isExpanded(idx) != want:
+                frozen.setExpanded(idx, want)
+        frozen.verticalScrollBar().setValue(self.tree.verticalScrollBar().value())
 
     # ── All interaction goes through itemClicked ───────────────────────────────
 
@@ -5814,6 +5907,13 @@ class MainWindow(QMainWindow):
                     "Autosave skipped -- save the show once (Save As) so autosave has a file to write to", 6000)
             return
         if self._dirty:
+            # Never save in the middle of a fade: serialising a large show
+            # takes ~0.1-0.4 s on the main thread -- the same thread that
+            # steps fades and handles GO -- so a save mid-fade would briefly
+            # freeze the faders. Retry shortly after instead.
+            if getattr(self.osc, '_fade_jobs', None):
+                QTimer.singleShot(3000, self._autosave)
+                return
             try:
                 self._collect_app_settings()
                 self.show_file.save(self.show_file.filepath)
@@ -6036,7 +6136,7 @@ class MainWindow(QMainWindow):
                 n = len(self.show_file.snapshots) + 1
                 snap = Snapshot(name.strip(), n)
                 with self.osc._wing_state_lock:
-                    snap.data = dict(self.osc._wing_state)
+                    snap.data = _snapshot_copy(self.osc._wing_state)
                 self.show_file.snapshots.append(snap)
                 self._mark_dirty()
                 self._refresh_cue_list()
@@ -6408,16 +6508,21 @@ class MainWindow(QMainWindow):
 
     def _osc_addsnap(self, name: str):
         """Add a new snapshot via OSC /wingtheatre/addsnap [name]"""
+        # Same rule as the Add Snap button: needs a connected, synced Wing.
+        # (This remote path was missed when the lock was introduced --
+        # it could still create cues with no console data offline.)
+        if not self._wing_ready("Add Snap (OSC/Companion)"):
+            return
         n = len(self.show_file.snapshots) + 1
         snap_name = name.strip() if name.strip() else f"Scene {n:03d}"
         snap = Snapshot(snap_name, n)
-        if self.osc._wing_state:
-            with self.osc._wing_state_lock:
-                snap.data = dict(self.osc._wing_state)
+        with self.osc._wing_state_lock:
+            snap.data = _snapshot_copy(self.osc._wing_state)
         self.show_file.snapshots.append(snap)
         self._mark_dirty()
         self._refresh_cue_list()
         self.cue_panel.set_current(n - 1)
+        self.cue_panel.mark_active(n - 1); self.active_cue_index = n - 1
         self.status_bar.showMessage(
             f"OSC: '{snap_name}' created with {len(snap.data)} parameters", 4000)
 
@@ -6495,7 +6600,7 @@ class MainWindow(QMainWindow):
                 "Wing state not ready -- wait for sync to complete", 4000)
             return
         with self.osc._wing_state_lock:
-            snap.data = dict(self.osc._wing_state)
+            snap.data = _snapshot_copy(self.osc._wing_state)
         self._mark_dirty()
         live_events = getattr(self.osc, '_live_event_count', 0)
         self.status_bar.showMessage(

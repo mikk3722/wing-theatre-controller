@@ -150,6 +150,27 @@ fn main() -> Result<(), libwing::Error> {
     tx_out.send("Connected!".to_string()).ok();
 
     // SYNC
+    // Input SOURCE nodes (/io/in/GRP/N). Wing shows the source's name on a
+    // channel strip whenever the channel's own name is empty, so the app
+    // needs these to show the same names. Only paths the console schema
+    // actually knows (name_to_id) are requested -- unknown group/number
+    // combinations are skipped. Requested as whole nodes, exactly like
+    // /ch/N below, so each one ends with a normal RequestEnd.
+    // Groups and ranges verified against the real propmap.jsonl schema:
+    // CRD/MOD go to 64 and USR to 56, so loop to 64 and let name_to_id
+    // skip what doesn't exist. Internal '$' groups are deliberately left out.
+    let io_groups = ["LCL", "AUX", "A", "B", "C", "SC", "USB", "CRD", "MOD", "PLAY", "AES", "USR", "OSC"];
+    let mut io_paths: Vec<String> = Vec::new();
+    for g in io_groups.iter() {
+        for i in 1..=64 {
+            let p = format!("/io/in/{}/{}", g, i);
+            if WingConsole::name_to_id(&p).is_some() {
+                io_paths.push(p);
+            }
+        }
+    }
+    eprintln!("[wingmon] SYNC: {} input source nodes", io_paths.len());
+
     let sync_paths: Vec<String> =
         (1..=48).map(|i| format!("/ch/{}", i))
         .chain((1..=16).map(|i| format!("/bus/{}", i)))
@@ -157,6 +178,7 @@ fn main() -> Result<(), libwing::Error> {
         .chain((1..=8).map(|i|  format!("/mtx/{}", i)))
         .chain((1..=16).map(|i| format!("/dca/{}", i)))
         .chain((1..=16).map(|i| format!("/fx/{}", i)))
+        .chain(io_paths.into_iter())
         .collect();
 
     let mut total = 0usize;
@@ -237,7 +259,51 @@ fn main() -> Result<(), libwing::Error> {
             }
         }
 
-        for l in rx_cmd {
+        let mut pending: Option<String> = None;
+        loop {
+            let l = match pending.take() {
+                Some(p) => p,
+                None => match rx_cmd.recv() {
+                    Ok(l) => l,
+                    Err(_) => break,   // all senders dropped -- shutting down
+                },
+            };
+
+            // Coalesce BATCH_SET: if another BATCH_SET is already waiting
+            // right behind this one, skip straight to the newest instead
+            // of processing this one first. Each fade tick's BATCH_SET
+            // fully supersedes the previous tick's (same parameters, more
+            // up-to-date values), so there is nothing lost by skipping a
+            // stale one -- but there is a LOT to lose by not skipping it:
+            // with no backpressure between Python's fixed 40fps tick timer
+            // and however fast Wing can actually absorb commands, if Wing
+            // ever falls behind for a sustained period (e.g. a long fade
+            // with many simultaneously-fading parameters, while Wing is
+            // also busy with real-time audio during a live show), this
+            // queue would otherwise grow without bound and keep hammering
+            // Wing with an ever-growing backlog of now-irrelevant
+            // intermediate steps for minutes after the fade should have
+            // finished -- exactly the kind of sustained overload that can
+            // take down Wing's own network stack for every connected
+            // client, not just this one, and not recoverable until this
+            // process is killed. Coalescing means wingmon always converges
+            // on the current target instead of drowning in stale history.
+            let mut l = l;
+            let mut coalesced = 0u32;
+            if l.trim().starts_with("BATCH_SET ") {
+                while let Ok(next) = rx_cmd.try_recv() {
+                    if next.trim().starts_with("BATCH_SET ") {
+                        l = next;   // supersede -- work with the newer one
+                        coalesced += 1;
+                    } else {
+                        pending = Some(next);   // not coalescable -- preserve for next iteration, in order
+                        break;
+                    }
+                }
+            }
+            if coalesced > 0 {
+                eprintln!("[wingmon] BATCH_SET backlog: skipped {} stale tick(s), Wing may be falling behind", coalesced);
+            }
             let trimmed = l.trim();
             let mut reconnect = false;
 
