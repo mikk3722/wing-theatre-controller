@@ -123,27 +123,141 @@ jobs:
             --add-data "version.txt:." \
             --hidden-import PyQt6.sip \
             --hidden-import pythonosc \
+            --osx-bundle-identifier dk.mikkelpeterlarsen.wingtheatre \
             wing_theatre.py
+          # Info.plist: version shown in Finder, and the text macOS shows
+          # when it asks for Local Network access (needed to reach the Wing).
+          PLIST="dist/Wing Theatre Controller.app/Contents/Info.plist"
+          VER="${GITHUB_REF_NAME#v}"
+          plutil -replace CFBundleShortVersionString -string "$VER" "$PLIST" || true
+          plutil -replace CFBundleVersion -string "${{ github.run_number }}" "$PLIST" || true
+          plutil -replace NSLocalNetworkUsageDescription -string \
+            "Wing Theatre Controller needs local network access to communicate with the Behringer Wing." "$PLIST"
 
-      - name: Sign app (ad-hoc)
+      # ── Code signing ────────────────────────────────────────────────────
+      # With the Apple Developer secrets set in GitHub (Settings -> Secrets
+      # and variables -> Actions), the app is signed with the Developer ID
+      # certificate and notarised by Apple, so it opens with a normal
+      # double-click on any Mac. Without the secrets the build falls back
+      # to the old ad-hoc signing, so a build never fails just because the
+      # secrets are missing.
+      - name: Import Developer ID certificate
+        env:
+          MACOS_CERT_P12:      ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
         run: |
-          # Ad-hoc signing (no Apple Developer account needed) -- required
-          # on Apple Silicon Macs for the app to launch at all. Without
-          # this, an unsigned .app can fail with "app is damaged and can't
-          # be opened" on M1/M2/M3 Macs instead of just the milder
-          # "unidentified developer" Gatekeeper prompt.
-          # --deep signs every nested binary/dylib inside the bundle, not
-          # just the top-level app wrapper.
-          codesign --force --deep --sign - "dist/Wing Theatre Controller.app"
-          codesign --verify --verbose "dist/Wing Theatre Controller.app"
+          if [ -z "$MACOS_CERT_P12" ]; then
+            echo "No MACOS_CERT_P12 secret -- ad-hoc signing will be used."
+            exit 0
+          fi
+          KC="$RUNNER_TEMP/signing.keychain-db"
+          KC_PASS="$(uuidgen)"
+          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KC_PASS" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KC_PASS" "$KC"
+          security import "$RUNNER_TEMP/cert.p12" -P "$MACOS_CERT_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KC"
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KC_PASS" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          IDENTITY=$(security find-identity -v -p codesigning "$KC" \
+                     | grep "Developer ID Application" | head -1 | awk '{print $2}')
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::No 'Developer ID Application' certificate found in MACOS_CERT_P12"
+            exit 1
+          fi
+          echo "SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          echo "SIGN_KEYCHAIN=$KC" >> "$GITHUB_ENV"
+
+      - name: Sign app
+        run: |
+          APP="dist/Wing Theatre Controller.app"
+          if [ -z "$SIGN_IDENTITY" ]; then
+            # Fallback: ad-hoc (no Apple account). Needed on Apple Silicon
+            # for the app to launch at all, but Gatekeeper still blocks
+            # the first launch (right-click -> Open / Open Anyway).
+            codesign --force --deep --sign - "$APP"
+            codesign --verify --verbose "$APP"
+            exit 0
+          fi
+          SIGN=(codesign --force --timestamp --options runtime --sign "$SIGN_IDENTITY")
+          # Sign inside-out: every Mach-O file first (dylibs, .so, Qt,
+          # wingmon), then each .framework bundle (deepest first), then
+          # the app itself with its entitlements. Symlinks are skipped
+          # (find -type f). The main executable is re-signed last as part
+          # of the app bundle.
+          while IFS= read -r -d '' f; do
+            if file -b "$f" | grep -q "Mach-O"; then
+              "${SIGN[@]}" "$f"
+            fi
+          done < <(find "$APP/Contents" -type f -print0)
+          find "$APP/Contents" -type d -name "*.framework" \
+            | awk '{ print length, $0 }' | sort -rn | cut -d' ' -f2- \
+            | while IFS= read -r fw; do "${SIGN[@]}" "$fw"; done
+          "${SIGN[@]}" --entitlements entitlements.plist "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign -dv "$APP" 2>&1 | grep -E "Authority|TeamIdentifier|flags"
+
+      - name: Notarise app
+        env:
+          APPLE_ID:           ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID:      ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -z "$SIGN_IDENTITY" ] || [ -z "$APPLE_ID" ]; then
+            echo "Not notarising (no Developer ID certificate or Apple ID secrets)."
+            exit 0
+          fi
+          APP="dist/Wing Theatre Controller.app"
+          ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/app.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/app.zip" \
+            --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 30m --output-format json > "$RUNNER_TEMP/notary.json" || true
+          cat "$RUNNER_TEMP/notary.json"
+          STATUS=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('status',''))" "$RUNNER_TEMP/notary.json")
+          if [ "$STATUS" != "Accepted" ]; then
+            SUB=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('id',''))" "$RUNNER_TEMP/notary.json")
+            [ -n "$SUB" ] && xcrun notarytool log "$SUB" \
+              --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID"
+            echo "::error::Notarisation failed ($STATUS) -- see Apple's log above"
+            exit 1
+          fi
+          # Staple the ticket into the app itself, so it also opens on a
+          # Mac with no internet (typical for a theatre/FOH machine).
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+          spctl --assess --type execute --verbose=2 "$APP"
 
       - name: Create DMG
+        env:
+          APPLE_ID:           ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID:      ${{ secrets.APPLE_TEAM_ID }}
         run: |
+          DMG="WingTheatreController-macos.dmg"
           hdiutil create \
             -volname "Wing Theatre Controller" \
             -srcfolder "dist/Wing Theatre Controller.app" \
             -ov -format UDZO \
-            "WingTheatreController-macos.dmg"
+            "$DMG"
+          if [ -n "$SIGN_IDENTITY" ]; then
+            codesign --force --timestamp --sign "$SIGN_IDENTITY" "$DMG"
+            if [ -n "$APPLE_ID" ]; then
+              xcrun notarytool submit "$DMG" \
+                --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" \
+                --wait --timeout 30m
+              xcrun stapler staple "$DMG"
+              xcrun stapler validate "$DMG"
+            fi
+          fi
+
+      - name: Remove signing keychain
+        if: always()
+        run: |
+          if [ -n "$SIGN_KEYCHAIN" ]; then
+            security delete-keychain "$SIGN_KEYCHAIN" || true
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
