@@ -573,20 +573,30 @@ class ShowFile:
 # ─── Remote Control TCP Server ────────────────────────────────────────────────
 class RemoteTCPServer(QObject):
     """
-    Single-client TCP server for Companion/remote control.
+    TCP server for Companion/remote control -- up to MAX_CLIENTS (4)
+    simultaneous connections, e.g. Companion on the FOH laptop, a Stream
+    Deck at the prompt desk and a backup machine at the same time.
+    Every connected client can send commands, and every state change is
+    sent to all of them.
+
+    A connection beyond the limit is refused (it gets one
+    "ERROR server full" line and is closed) -- an existing client is never
+    kicked off to make room, so a stray extra connection can't take
+    control away from a working Companion mid-show.
+
     Protocol (newline-delimited UTF-8):
       Client→Server:  GO / NEXT_GO / PREV_GO / SNAP_GO <n|name>
                       AU_ON / AU_OFF / AU_TOGGLE / ADD_SNAP [name] / GET_STATE
       Server→Client:  STATE key=value
     """
+    MAX_CLIENTS = 4
     command_received = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._port    = 9000
         self._server  = None
-        self._client  = None
-        self._client_addr = None
+        self._clients = {}      # socket -> "ip:port"
         self._running = False
         self._thread  = None
         self._lock    = threading.Lock()
@@ -602,34 +612,55 @@ class RemoteTCPServer(QObject):
     def stop(self):
         self._running = False
         with self._lock:
-            if self._client:
-                try: self._client.close()
-                except: pass
-                self._client = None
-            if self._server:
-                try: self._server.close()
-                except: pass
-                self._server = None
+            clients = list(self._clients)
+            self._clients.clear()
+            srv, self._server = self._server, None
+        for c in clients:
+            try: c.close()
+            except: pass
+        if srv:
+            try: srv.close()
+            except: pass
 
     def send_state(self, key: str, value):
-        msg = f"STATE {key}={value}\n"
+        """Send one state line to every connected client. A client that
+        can't take it (gone, or stalled long enough to fill its socket
+        buffer) is dropped; the others are unaffected."""
+        msg = f"STATE {key}={value}\n".encode()
         with self._lock:
-            c = self._client
-        if not c:
-            return
-        try:
-            c.sendall(msg.encode())
-        except Exception:
-            with self._lock:
-                self._client = None
+            clients = list(self._clients)
+        dead = []
+        for c in clients:
+            try:
+                c.sendall(msg)
+            except Exception:
+                dead.append(c)
+        for c in dead:
+            self._drop(c)
 
     def send_full_state(self, state: dict):
         for k, v in state.items():
             self.send_state(k, v)
 
     @property
+    def client_addrs(self):
+        """'ip:port' of every connected client, in connection order."""
+        with self._lock:
+            return list(self._clients.values())
+
+    @property
     def client_addr(self):
-        return self._client_addr
+        """Backwards compatible: the most recently connected client, or None."""
+        addrs = self.client_addrs
+        return addrs[-1] if addrs else None
+
+    def _drop(self, conn):
+        with self._lock:
+            addr = self._clients.pop(conn, None)
+        try: conn.close()
+        except: pass
+        if addr is not None:
+            self.command_received.emit(f"__disconnected__{addr}")
 
     def _serve(self):
         import socket as _socket
@@ -637,7 +668,7 @@ class RemoteTCPServer(QObject):
             srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
             srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
             srv.bind(("0.0.0.0", self._port))
-            srv.listen(1)
+            srv.listen(self.MAX_CLIENTS)
             srv.settimeout(1.0)
             with self._lock:
                 self._server = srv
@@ -648,27 +679,40 @@ class RemoteTCPServer(QObject):
                     continue
                 except Exception:
                     break
+                label = f"{addr[0]}:{addr[1]}"
                 with self._lock:
-                    if self._client:
-                        try: self._client.close()
-                        except: pass
-                    self._client = conn
-                    self._client_addr = addr[0]
-                self.command_received.emit(f"__connected__{addr[0]}")
-                self._handle_client(conn)
-                with self._lock:
-                    if self._client is conn:
-                        self._client = None
-                        self._client_addr = None
-                self.command_received.emit("__disconnected__")
+                    full = len(self._clients) >= self.MAX_CLIENTS
+                    if not full:
+                        self._clients[conn] = label
+                if full:
+                    try:
+                        conn.sendall(b"ERROR server full (max 4 connections)\n")
+                    except Exception:
+                        pass
+                    try: conn.close()
+                    except: pass
+                    self.command_received.emit(f"__refused__{label}")
+                    continue
+                conn.settimeout(1.0)
+                self.command_received.emit(f"__connected__{label}")
+                threading.Thread(target=self._client_loop, args=(conn,),
+                                 daemon=True, name=f"RemoteTCP-{label}").start()
         except Exception:
             pass
+
+    def _client_loop(self, conn):
+        try:
+            self._handle_client(conn)
+        finally:
+            self._drop(conn)
 
     def _handle_client(self, conn):
         import socket as _socket
         buf = ""
-        conn.settimeout(1.0)
         while self._running:
+            with self._lock:
+                if conn not in self._clients:
+                    break       # dropped by send_state / stop()
             try:
                 data = conn.recv(1024).decode(errors="replace")
                 if not data:
@@ -2417,7 +2461,7 @@ class SnapshotOscTab(QWidget):
                 f"background:#1a6b3a;color:#7fff9a;border:1px solid #2a9b5a;"
                 f"border-radius:4px;padding:3px 8px;")
             if client_addr:
-                self.tcp_status.setText(f"● Connected: {client_addr}")
+                self.tcp_status.setText(f"● Connected {client_addr}")
                 self.tcp_status.setStyleSheet("color:#7fff9a;font-size:11px;")
             else:
                 self.tcp_status.setText(f"● Listening on port {self.tcp_port.value()}")
@@ -5251,7 +5295,8 @@ class OscSettingsPanel(QWidget):
             "  AU_ON / AU_OFF / AU_TOGGLE  /  ADD_SNAP [name]  /  GET_STATE\n"
             "Feedback sent on change:\n"
             "  STATE current_cue_num=001  /  current_cue_name=Scene 1\n"
-            "  STATE next_cue_num=002  /  autoupdate=true  /  wing_connected=true")
+            "  STATE next_cue_num=002  /  autoupdate=true  /  wing_connected=true\n"
+            "Up to 4 Companion connections at the same time.")
         tcp_hint.setStyleSheet(
             f"color:{C['text3']};font-size:11px;font-family:'Courier New',monospace;"
             f"background:{C['bg']};border:1px solid {C['border']};"
@@ -5269,7 +5314,7 @@ class OscSettingsPanel(QWidget):
                 f"background:#1a6b3a;color:#7fff9a;border:1px solid #2a9b5a;"
                 f"border-radius:4px;padding:3px 8px;")
             if client_addr:
-                self.tcp_status.setText(f"● Connected: {client_addr}")
+                self.tcp_status.setText(f"● Connected {client_addr}")
                 self.tcp_status.setStyleSheet("color:#7fff9a;font-size:11px;")
             else:
                 self.tcp_status.setText(f"● Listening on port {self.tcp_port.value()}")
@@ -6385,18 +6430,41 @@ class MainWindow(QMainWindow):
         })
         self.tcp_server.send_full_state(state)
 
+    def _tcp_update_status(self):
+        """Show how many Companion clients are connected, and from where."""
+        addrs = self.tcp_server.client_addrs
+        if addrs:
+            ips = ", ".join(a.rsplit(":", 1)[0] for a in addrs)
+            self.osc_settings_panel.tcp_set_running(
+                True, f"{len(addrs)}/{RemoteTCPServer.MAX_CLIENTS}: {ips}")
+        else:
+            self.osc_settings_panel.tcp_set_running(True)   # still listening
+
     def _on_tcp_command(self, cmd: str):
         """Handle command from TCP Companion client."""
         # Connection events
         if cmd.startswith("__connected__"):
             addr = cmd[len("__connected__"):]
-            self.osc_settings_panel.tcp_set_running(True, addr)
-            self.status_bar.showMessage(f"TCP: Companion connected from {addr}", 3000)
+            self._tcp_update_status()
+            n = len(self.tcp_server.client_addrs)
+            self.status_bar.showMessage(
+                f"TCP: Companion connected from {addr}  ({n}/{RemoteTCPServer.MAX_CLIENTS})", 3000)
+            # Full state goes to everyone -- harmless for clients already
+            # connected (same values), and the new one gets everything.
             self._tcp_send_full_state()
             return
-        if cmd == "__disconnected__":
-            self.osc_settings_panel.tcp_set_running(True)  # still listening
-            self.status_bar.showMessage("TCP: Companion disconnected", 3000)
+        if cmd.startswith("__disconnected__"):
+            addr = cmd[len("__disconnected__"):]
+            self._tcp_update_status()
+            n = len(self.tcp_server.client_addrs)
+            self.status_bar.showMessage(
+                f"TCP: Companion disconnected ({addr})  ({n}/{RemoteTCPServer.MAX_CLIENTS})", 3000)
+            return
+        if cmd.startswith("__refused__"):
+            addr = cmd[len("__refused__"):]
+            self.status_bar.showMessage(
+                f"⚠ TCP: connection from {addr} refused -- already "
+                f"{RemoteTCPServer.MAX_CLIENTS} Companion connections", 6000)
             return
 
         cmd_raw = cmd.strip()
