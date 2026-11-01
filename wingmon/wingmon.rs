@@ -3,7 +3,7 @@ use utils::Args;
 use std::result::Result;
 use std::io::{BufRead, Write};
 use std::sync::mpsc;
-use libwing::{WingConsole, WingResponse};
+use libwing::{WingConsole, WingResponse, WingNodeData};
 
 fn print_node(tx: &mpsc::Sender<String>, prefix: &str, id: i32, val: &str) {
     match WingConsole::id_to_defs(id) {
@@ -57,6 +57,33 @@ fn print_node(tx: &mpsc::Sender<String>, prefix: &str, id: i32, val: &str) {
                 }
             }
         }
+    }
+}
+
+/// Text form of a value as sent to the app. libwing's get_string() prints
+/// a whole-number FLOAT without a decimal point (0.0 -> "0", -10.0 -> "-10"),
+/// which made e.g. a fader at exactly 0 dB look like the integer 0 -- and it
+/// was then sent back to Wing as an int token instead of a float. Floats
+/// always keep a decimal point here, so the type survives the round trip
+/// (app -> show file -> recall -> encode_param) exactly as Wing sent it.
+fn value_string(data: &WingNodeData) -> String {
+    if data.has_string() {
+        data.get_string()
+    } else if data.has_float() {
+        fmt_f32(data.get_float())
+    } else if data.has_int() {
+        data.get_int().to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn fmt_f32(f: f32) -> String {
+    let s = f.to_string();     // shortest text that reads back as the same f32
+    if f.is_finite() && !s.contains('.') && !s.contains('e') {
+        format!("{}.0", s)
+    } else {
+        s
     }
 }
 
@@ -177,6 +204,22 @@ mod encode_tests {
     }
 
     #[test]
+    fn floats_keep_their_type_through_the_round_trip() {
+        for (f, txt) in [(0.0f32, "0.0"), (-10.0, "-10.0"), (-6.37, "-6.37"),
+                         (1234.567, "1234.567"), (0.001, "0.001")] {
+            let s = fmt_f32(f);
+            assert_eq!(s, txt);
+            // what the app sends back must be encoded as the SAME f32
+            let e = encode_param("#01020304", &s).unwrap();
+            assert_eq!(e[5], 0xd5, "{} must be sent as float32", s);
+            let back = f32::from_be_bytes([e[6], e[7], e[8], e[9]]);
+            assert_eq!(back.to_bits(), f.to_bits(), "{} changed on the way", s);
+        }
+        // a real integer stays an integer
+        assert_eq!(encode_param("#01020304", "0").unwrap()[5], 0x00);
+    }
+
+    #[test]
     fn strings() {
         assert_eq!(encode_param("#01020304", "").unwrap(), vec![0xd7, 1, 2, 3, 4, 0xd0]);
         assert_eq!(encode_param("#01020304", "BD").unwrap(), vec![0xd7, 1, 2, 3, 4, 0x81, b'B', b'D']);
@@ -186,11 +229,38 @@ mod encode_tests {
 fn main() -> Result<(), libwing::Error> {
     let mut args = Args::new("Usage: wingmon [-h host]\n   -h host : Wing IP");
     let mut host: Option<String> = None;
+    let mut encode_test = false;
     while args.has_next() {
         match args.next().as_str() {
             "-h" => { host = Some(args.next()); }
+            "--encode-test" => { encode_test = true; }
             _ => {}
         }
+    }
+
+    // Self-test mode (used by the app's --selftest): no Wing connection.
+    // Reads BATCH_SET lines from stdin and prints, for every parameter,
+    // the exact bytes that would be sent to Wing ("path<TAB>hex"), so the
+    // app can decode them and check the values that reach the console are
+    // the values it meant to send.
+    if encode_test {
+        let stdin = std::io::stdin();
+        let mut out = std::io::stdout();
+        for line in stdin.lock().lines() {
+            let Ok(l) = line else { break };
+            let Some(params) = l.trim_end_matches(['\r', '\n']).strip_prefix("BATCH_SET ") else { continue };
+            for param in params.split('\u{1f}') {
+                if let Some((path, val)) = param.split_once('=') {
+                    let hex = match encode_param(path.trim(), val) {
+                        Some(b) => b.iter().map(|x| format!("{:02x}", x)).collect::<String>(),
+                        None => "NONE".to_string(),
+                    };
+                    let _ = writeln!(out, "{}\t{}", path.trim(), hex);
+                }
+            }
+        }
+        let _ = out.flush();
+        return Ok(());
     }
 
     // stdout channel - single writer thread, explicit flush after every message
@@ -259,7 +329,7 @@ fn main() -> Result<(), libwing::Error> {
             match event_wing.read() {
                 Ok(WingResponse::RequestEnd)         => { pending -= 1; errors = 0; }
                 Ok(WingResponse::NodeData(id, data)) => {
-                    print_node(&tx_out, "DATA ", id, &data.get_string());
+                    print_node(&tx_out, "DATA ", id, &value_string(&data));
                     total += 1;
                     errors = 0;
                 }
@@ -494,7 +564,7 @@ fn main() -> Result<(), libwing::Error> {
         match event_wing.read() {
             Ok(WingResponse::NodeData(id, data)) => {
                 consecutive_errors = 0;
-                print_node(&tx_out, "", id, &data.get_string());
+                print_node(&tx_out, "", id, &value_string(&data));
             }
             Ok(_) => { consecutive_errors = 0; }
             Err(e) => {

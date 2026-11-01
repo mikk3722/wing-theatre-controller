@@ -1097,8 +1097,14 @@ class WingOSC(QObject):
         lookup = {}
         float_plain     = set()
         float_sectioned = set()
+        hash_float      = set()   # u32 ids of float-typed parameters
+        hash_other      = set()   # u32 ids of any other type
         CHANNEL_SECTIONS = {"eq", "gate", "dyn", "flt"}
-        FLOAT_TYPES = {"linear float", "log float"}
+        # "fader level" (faders, send/main levels) and "float enum" are
+        # floats too -- they were missing, so a fader at exactly 0 dB or
+        # -10 dB (which older wingmon builds printed as "0" / "-10") was
+        # stored and recalled as an integer.
+        FLOAT_TYPES = {"linear float", "log float", "fader level", "float enum"}
         try:
             with open(self.PROPMAP_PATH, encoding='utf-8') as f:
                 for line in f:
@@ -1111,6 +1117,9 @@ class WingOSC(QObject):
                             continue
                         parts = fn.split("/")
                         is_float = tp in FLOAT_TYPES and "$" not in fn
+                        pid = e.get("id")
+                        if isinstance(pid, int) and tp != "node":
+                            (hash_float if tp in FLOAT_TYPES else hash_other).add(pid & 0xffffffff)
                         # /ch/1/eq/lg -> parts = ['', 'ch', '1', 'eq', 'lg']
                         is_sectioned = (len(parts) == 5 and
                                         parts[1] in ("ch","bus","mtx","main","dca") and
@@ -1144,7 +1153,8 @@ class WingOSC(QObject):
             # Any other read problem must not stop wingmon from starting --
             # hash-addressed recall doesn't depend on propmap at all.
             self.log_message.emit(f"propmap.jsonl could not be read ({e}) -- continuing without it")
-        return lookup, {'plain': float_plain, 'sectioned': float_sectioned}
+        return lookup, {'plain': float_plain, 'sectioned': float_sectioned,
+                        'hash_float': hash_float, 'hash_other': hash_other}
 
     def _is_float_path(self, path):
         """Check whether a runtime path is a known float-typed parameter,
@@ -1773,6 +1783,44 @@ class WingOSC(QObject):
 
     # ── Subscription ─────────────────────────────────────────────────────────
 
+    def _ensure_float_keys(self):
+        if not getattr(self, '_float_keys', None):
+            self._prop_lookup, self._float_keys = self._load_dynamic_propmap()
+
+    def _value_text(self, path, value):
+        """The text sent to wingmon for one value. Keeps the type Wing
+        uses: a float always has a decimal point (wingmon then sends a
+        float32), an integer never has one. repr() gives the shortest text
+        that reads back as exactly the same number -- the old '%.6g' could
+        round e.g. 1234.567 Hz to 1234.57.
+        Shows saved by older versions can hold whole-number floats as ints
+        (e.g. a fader at 0 dB stored as 0); for parameters propmap knows to
+        be float, those are sent as floats again."""
+        if isinstance(value, bool):
+            value = int(value)
+        if '/#' in path:
+            # Hash-addressed: the raw text exactly as Wing sent it ...
+            txt = str(value)
+            fk = getattr(self, '_float_keys', None) or {}
+            if fk and txt.lstrip('-').isdigit():
+                # ... except an int-looking value for a parameter that is a
+                # float in every model propmap knows (older captures).
+                try:
+                    hid = int(path.rsplit('#', 1)[1], 16)
+                    if hid in fk.get('hash_float', ()) and hid not in fk.get('hash_other', ()):
+                        txt = f"{int(txt)}.0"
+                except ValueError:
+                    pass
+            return txt
+        if isinstance(value, int) and self._is_float_path(path):
+            value = float(value)
+        if isinstance(value, float):
+            txt = repr(value)
+            if '.' not in txt and 'e' not in txt and 'n' not in txt:   # inf/nan stay as is
+                txt += '.0'
+            return txt
+        return str(value)
+
     def _wingmon_stdin(self, cmd: str):
         """Send one command line to wingmon via stdin (BATCH_SET/SET/KEEPALIVE).
 
@@ -1842,6 +1890,7 @@ class WingOSC(QObject):
         self._cancel_all_fades()
 
         # Build param list: (path, value_str, is_priority)
+        self._ensure_float_keys()
         params = []
         faded_paths = set()
         import time as _time
@@ -1933,7 +1982,7 @@ class WingOSC(QObject):
                 # fade-echo guard, just for instantly-recalled values.
                 self._au_baseline[path] = value
                 is_pri = scope_key in ('mute', 'fader')
-                params.append((path, str(value), is_pri))
+                params.append((path, self._value_text(path, value), is_pri))
                 continue
             # `value` was already correctly typed (int vs float) at
             # capture time by _parse_wing_val, which checks propmap's
@@ -1952,13 +2001,7 @@ class WingOSC(QObject):
             # AU's baseline so Wing's confirmation echo of our own
             # recall isn't mistaken for a fresh user-driven change.
             self._au_baseline[path] = v
-            if isinstance(v, float):
-                vstr = f"{v:.6g}"
-                # Ensure decimal so wingmon uses set_float not set_int
-                if '.' not in vstr and 'e' not in vstr:
-                    vstr += '.0'
-            else:
-                vstr = str(v)
+            vstr = self._value_text(path, v)
             is_pri = scope_key in ('mute', 'fader')
             params.append((path, vstr, is_pri))
 
@@ -2272,13 +2315,7 @@ class WingOSC(QObject):
                 value = int(value)
             with self._wing_state_lock:
                 self._wing_state[path] = value
-            if isinstance(value, float):
-                vstr = f"{value:.6g}"
-                if '.' not in vstr and 'e' not in vstr:
-                    vstr += '.0'
-            else:
-                vstr = str(value)
-            parts.append(f"{path}={vstr}")
+            parts.append(f"{path}={self._value_text(path, value)}")
         if parts:
             self._wingmon_stdin(f"BATCH_SET {BATCH_SEP.join(parts)}")
 
@@ -7298,7 +7335,10 @@ def run_selftest(out_dir):
                 raise AssertionError(f"missing in the app: {p}")
         if sys.platform != 'win32' and not os.access(WingOSC.WINGMON_PATH, os.X_OK):
             raise AssertionError("wingmon is not executable")
-        return f"wingmon + propmap present ({os.path.basename(WingOSC.WINGMON_PATH)})"
+        name = os.path.basename(WingOSC.WINGMON_PATH)
+        if name not in ("wingmon", "wingmon.exe"):
+            raise AssertionError(f"wingmon bundled under the wrong name: {name}")
+        return f"wingmon + propmap present ({name})"
     check("bundle contains wingmon and propmap", t_bundle)
 
     def t_window():
@@ -7425,6 +7465,142 @@ def run_selftest(out_dir):
     check("fade down into mute", t_fade_down_into_mute)
     osc._cancel_all_fades()
     osc._wingmon_proc = None
+
+    # ── Values in = values out ─────────────────────────────────────────────
+    # Lines exactly as wingmon prints them during a sync -> the app's own
+    # parser -> stored in a cue -> recalled -> the BATCH_SET line for
+    # wingmon. Every value must come out with the same text and type it
+    # came in with. Then the bundled wingmon encodes that line in
+    # --encode-test mode, and the bytes are decoded again here: what would
+    # reach the Wing must be the same value and type (float32 / int / text).
+    RT_IN = [
+        ("/ch/1/fdr",               "DATA /ch/1/fdr = 0.0",                   "0.0"),
+        ("/ch/2/fdr",               "DATA /ch/2/fdr = -10.0",                 "-10.0"),
+        ("/ch/3/fdr",               "DATA /ch/3/fdr = -6.37",                 "-6.37"),
+        ("/ch/1/mute",              "DATA /ch/1/mute = 1",                    "1"),
+        ("/ch/1/pan",               "DATA /ch/1/pan = -12.5",                 "-12.5"),
+        ("/ch/1/send/1/lvl",        "DATA /ch/1/send/1/lvl = -3.25",          "-3.25"),
+        ("/ch/1/icon",              "DATA /ch/1/icon = 100",                  "100"),
+        ("/ch/1/name",              "DATA /ch/1/name = Lead, Vox",            "Lead, Vox"),
+        ("/ch/2/name",              "DATA /ch/2/name =",                      ""),
+        ("/ch/1/eq/mdl",            "DATA /ch/1/eq/mdl = STD",                "STD"),
+        ("/ch/1/eq/#a1b2c3d4",      "DATA ch/1:eq:prop7#a1b2c3d4 = 1234.567", "1234.567"),
+        ("/ch/1/gate/#0a0b0c0d",    "DATA ch/1:gate:prop3#0a0b0c0d = 80",     "80"),
+        ("/ch/1/dyn/#0b0c0d0e",     "DATA ch/1:dyn:prop5#0b0c0d0e = 0.0",     "0.0"),
+        ("/ch/1/dyn/#0c0d0e0f",     "DATA ch/1:dyn:prop6#0c0d0e0f = -2",      "-2"),
+    ]
+    rt_out = {}
+
+    def t_values_round_trip():
+        osc._cancel_all_fades()
+        fake = _FakeProc()
+        fake.stdout = io.StringIO("\n".join(l for _, l, _ in RT_IN) + "\n")
+        with osc._wing_state_lock:
+            osc._wing_state.clear()
+        osc._ensure_float_keys()
+        osc._wingmon_proc = fake
+        osc._wingmon_running = True
+        osc._wm_gen = 10**6
+        osc._wingmon_loop(-1)                 # parse exactly like a real sync
+        snap = Snapshot("Round trip", 99)
+        snap.scope = {k: True for k in WING_SCOPE_KEYS}
+        snap.channel_scopes = {}
+        snap.group_fades = {}
+        with osc._wing_state_lock:
+            snap.data = _snapshot_copy(osc._wing_state)
+        missing = [p for p, _, _ in RT_IN if p not in snap.data]
+        if missing:
+            raise AssertionError(f"not captured: {missing}")
+        sent = recall(snap, {})
+        for line in sent.sent():
+            if line.startswith("BATCH_SET "):
+                for part in line[len("BATCH_SET "):].split(BATCH_SEP):
+                    p, _, v = part.partition("=")
+                    rt_out[p] = v
+        bad = [f"{p}: in '{want}' out '{rt_out.get(p, '<not sent>')}'"
+               for p, _, want in RT_IN if rt_out.get(p) != want]
+        if bad:
+            raise AssertionError("; ".join(bad))
+        return f"{len(RT_IN)} values identical in and out"
+    check("values in = values out (app)", t_values_round_trip)
+    osc._wingmon_proc = None
+
+    def t_values_on_the_wire():
+        import subprocess, struct
+        wm = WingOSC.WINGMON_PATH
+        if not os.path.isfile(wm):
+            if getattr(sys, 'frozen', False):
+                raise AssertionError(f"wingmon missing: {wm}")
+            return "wingmon not built here -- skipped"
+        if not rt_out:
+            raise AssertionError("no values from the previous check")
+        line = "BATCH_SET " + BATCH_SEP.join(f"{p}={v}" for p, v in rt_out.items()) + "\n"
+        kw = {}
+        if sys.platform == 'win32':
+            kw['creationflags'] = subprocess.CREATE_NO_WINDOW
+        r = subprocess.run([wm, "--encode-test"], input=line.encode("utf-8"),
+                           capture_output=True, timeout=20, **kw)
+        enc = {}
+        for l in r.stdout.decode("utf-8", "replace").splitlines():
+            if "\t" in l:
+                p, h = l.split("\t", 1)
+                enc[p] = h
+        bad = []
+        for p, _, want in RT_IN:
+            h = enc.get(p)
+            if not h or h == "NONE":
+                bad.append(f"{p}: wingmon could not encode it"); continue
+            raw = bytes.fromhex(h)
+            b = bytearray(); i = 0             # undo 0xdf escaping
+            while i < len(raw):
+                b.append(raw[i])
+                i += 2 if raw[i] == 0xdf and i + 1 < len(raw) and raw[i + 1] == 0xde else 1
+            if b[0] != 0xd7 or len(b) < 6:
+                bad.append(f"{p}: not a node-hash + value ({h})"); continue
+            if '#' in p and b[1:5].hex() != p.rsplit('#', 1)[1]:
+                bad.append(f"{p}: wrong address {b[1:5].hex()}"); continue
+            tok, data = b[5], bytes(b[6:])
+            if tok <= 0x3f:
+                kind, val = "int", tok
+            elif tok == 0xd3:
+                kind, val = "int", struct.unpack(">h", data[:2])[0]
+            elif tok == 0xd4:
+                kind, val = "int", struct.unpack(">i", data[:4])[0]
+            elif tok == 0xd5:
+                kind, val = "float", struct.unpack(">f", data[:4])[0]
+            elif tok == 0xd0:
+                kind, val = "text", ""
+            elif 0x80 <= tok <= 0xbf:
+                kind, val = "text", data[:tok - 0x7f].decode("utf-8")
+            elif tok == 0xd1:
+                kind, val = "text", data[1:1 + data[0] + 1].decode("utf-8")
+            else:
+                bad.append(f"{p}: unexpected token 0x{tok:02x}"); continue
+            if want == "" or not want.lstrip('-').replace('.', '', 1).isdigit():
+                exp_kind, ok = "text", (val == want)
+            elif '.' in want:
+                exp_kind = "float"
+                ok = kind == "float" and struct.pack(">f", float(want)) == struct.pack(">f", val)
+            else:
+                exp_kind, ok = "int", (val == int(want))
+            if kind != exp_kind or not ok:
+                bad.append(f"{p}: sent '{want}' but Wing would get {kind} {val!r}")
+        if bad:
+            raise AssertionError("; ".join(bad))
+        return f"{len(RT_IN)} values reach the Wing unchanged (type and value)"
+    check("values in = values out (bytes to the Wing)", t_values_on_the_wire)
+
+    def t_old_show_types():
+        osc._ensure_float_keys()
+        fk = osc._float_keys or {}
+        if not fk.get('plain'):
+            return "propmap not available here -- skipped"
+        if osc._value_text("/ch/7/fdr", 0) != "0.0":
+            raise AssertionError(f"old int fader sent as {osc._value_text('/ch/7/fdr', 0)!r}")
+        if osc._value_text("/ch/7/mute", 1) != "1":
+            raise AssertionError("mute became a float")
+        return "whole-number faders from older shows are sent as floats"
+    check("older show files keep float types", t_old_show_types)
 
     def t_tcp():
         srv = RemoteTCPServer()

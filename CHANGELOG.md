@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- **Values keep their exact type and value from Wing to Wing.** libwing printed a whole-number float without a
+  decimal point (a fader at exactly 0 dB came out as "0"), so it was stored – and recalled – as an *integer*.
+  wingmon now always sends floats with a decimal point, the app knows that faders, send/main levels and float
+  enums are floats, and values from older show files are sent as floats again where the console expects one.
+- Floats are sent with full precision (e.g. 1234.567 Hz is no longer rounded to 1234.57).
+- Self-test: "values in = values out" – lines exactly as wingmon prints them go through the app's parser, a cue
+  and a recall, and must come out unchanged; the bundled wingmon then encodes them (new `--encode-test` mode)
+  and the bytes for the Wing are decoded and checked for the same value and type.
+- macOS: wingmon is bundled as `wingmon` again (it was bundled as `wingmon-macos` together with the Rust
+  sources, and only found through a fallback). The self-test now insists on the right name.
+- GitHub Actions updated to their Node 24 versions.
+
 ## 1.9.11 – 2026-11-01
 
 **New (both can be switched on/off, saved with the show)**

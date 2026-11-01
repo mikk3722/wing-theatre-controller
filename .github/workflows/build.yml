@@ -17,7 +17,7 @@ jobs:
   build-wingmon-macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -33,7 +33,7 @@ jobs:
           cargo test --release --example wingmon   # wingmon's encoder tests
           cp target/release/examples/wingmon ../wingmon-macos
           codesign --sign - --force ../wingmon-macos
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: wingmon-macos
           path: wingmon-macos
@@ -41,7 +41,7 @@ jobs:
   build-wingmon-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -56,7 +56,7 @@ jobs:
           cargo build --release --example wingmon
           cargo test --release --example wingmon   # wingmon's encoder tests
           Copy-Item target/release/examples/wingmon.exe ../wingmon.exe
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: wingmon-windows
           path: wingmon.exe
@@ -65,14 +65,14 @@ jobs:
     runs-on: macos-latest
     needs: build-wingmon-macos
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v6
         with:
           name: wingmon-macos
           path: .
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
@@ -92,8 +92,13 @@ jobs:
           # a local dev copy happened to exist at ~/WingTheatre/wingmon as
           # a fallback (which is why this went unnoticed testing on the
           # dev machine, but failed for every other tester).
-          cp wingmon-macos wingmon
-          chmod +x wingmon
+          # NOTE: not "cp wingmon-macos wingmon" -- the repo has a FOLDER
+          # called wingmon/ (the Rust source), so that copied the binary
+          # INTO the folder and the whole folder got bundled. A separate
+          # folder keeps the bundle clean: Contents/Frameworks/wingmon.
+          mkdir -p bundle-bin
+          cp wingmon-macos bundle-bin/wingmon
+          chmod +x bundle-bin/wingmon
           # Write version file
           echo "${{ github.ref_name }} (build ${{ github.run_number }}, $(date +%Y-%m-%d))" > version.txt
           # Copy propmap from libwing
@@ -106,7 +111,7 @@ jobs:
             --noconfirm \
             --name "Wing Theatre Controller" \
             --windowed \
-            --add-data "wingmon:." \
+            --add-data "bundle-bin/wingmon:." \
             --add-data "propmap.jsonl:." \
             --add-data "version.txt:." \
             --hidden-import PyQt6.sip \
@@ -261,7 +266,7 @@ jobs:
             security delete-keychain "$SIGN_KEYCHAIN" || true
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: WingTheatreController-macos
           path: WingTheatreController-macos.dmg
@@ -274,14 +279,14 @@ jobs:
       # them the build still succeeds, just unsigned (as before).
       HAS_AZURE_SIGNING: ${{ secrets.AZURE_CLIENT_SECRET != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v6
         with:
           name: wingmon-windows
           path: .
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
@@ -442,7 +447,7 @@ jobs:
             -Path "installer-out\WingTheatreController-Setup.exe" `
             -DestinationPath "WingTheatreController-windows-installer.zip"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: always()
         with:
           name: selftest-windows
@@ -451,7 +456,7 @@ jobs:
             installed-selftest
           if-no-files-found: ignore
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: WingTheatreController-windows
           path: |
@@ -461,9 +466,9 @@ jobs:
   package-companion:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
 
@@ -478,7 +483,7 @@ jobs:
       - name: Package companion module
         run: zip -r companion-module-wingtheatre.zip companion-module/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: companion-module
           path: companion-module-wingtheatre.zip
@@ -490,7 +495,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v6
 
       - uses: softprops/action-gh-release@v2
         with:
