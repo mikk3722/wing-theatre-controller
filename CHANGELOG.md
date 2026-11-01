@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.9.12 – 2026-11-01
 
 - **Values keep their exact type and value from Wing to Wing.** libwing printed a whole-number float without a
   decimal point (a fader at exactly 0 dB came out as "0"), so it was stored – and recalled – as an *integer*.
