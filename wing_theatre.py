@@ -9,6 +9,7 @@ import datetime
 import copy
 import json
 import threading
+import re
 
 def _copy_channel_scopes(src):
     """
@@ -245,7 +246,11 @@ for k in ["conn", "rack_config", "tags"]:
 
 # Path groups in the main channel scope tree (no FX or Config here)
 SCOPE_PATH_GROUPS = [
-    ("inputs", "All Input Channels", [(f"input_{i+1:02d}", f"Input Ch {i+1:02d}") for i in range(48)]),
+    # The Wing has 40 input channels plus 8 Aux inputs (/aux/1..8). Earlier
+    # versions showed "Input Ch 41-48", which don't exist on the console,
+    # and the Aux inputs were not synced, stored or recalled at all.
+    ("inputs", "All Input Channels", [(f"input_{i+1:02d}", f"Input Ch {i+1:02d}") for i in range(40)]),
+    ("aux",    "All Aux Inputs",     [(f"aux_{i+1:02d}",   f"Aux In {i+1:02d}")   for i in range(8)]),
     ("buses",  "All Buses",          [(f"bus_{i+1:02d}",   f"Bus {i+1:02d}")       for i in range(16)]),
     ("matrix", "All Matrix Outputs", [(f"matrix_{i+1:02d}",f"Matrix {i+1:02d}")    for i in range(8)]),
     ("mains",  "Main Outputs",       [("main_1","Main 1"), ("main_2","Main 2"),
@@ -253,12 +258,18 @@ SCOPE_PATH_GROUPS = [
     ("dcas",   "DCA Groups",         [(f"dca_{i+1:02d}",   f"DCA {i+1:02d}")       for i in range(16)]),
 ]
 
+# Rows with bus/matrix sends (and the groups they live in)
+SEND_GROUPS = ("inputs", "aux", "buses")
+
+def _has_sends(ch_key):
+    return ch_key.startswith(("input_", "aux_", "bus_"))
+
 # Scope keys applicable to DCA groups (no EQ, dynamics, inserts, sends, filter, input)
 DCA_APPLICABLE = {"fader", "mute", "custom"}
 
 # Scope-tree row key -> the console's name path, e.g. input_01 -> /ch/1/name,
 # matrix_02 -> /mtx/2/name. Used to show "Input Ch 01 (BD)" style labels.
-_CH_KEY_NAME_KIND = {"input": "ch", "bus": "bus", "matrix": "mtx", "main": "main", "dca": "dca"}
+_CH_KEY_NAME_KIND = {"input": "ch", "aux": "aux", "bus": "bus", "matrix": "mtx", "main": "main", "dca": "dca"}
 
 def _ch_key_to_name_path(ch_key):
     kind, _, num = (ch_key or "").rpartition('_')
@@ -291,11 +302,45 @@ CFG_ITEMS = [
     # change the names on the console. ON by default (also for cues saved
     # before this item existed), like the channel Name column.
     ("cfg_src_names", "Input source names  (Local / A / B / C / AES / USB … -- the names the channels show)"),
-    ("cfg_surface", "Surface Layout"),
-    ("cfg_prefs",   "Preferences"),
-    ("cfg_layers",  "Layers  (Left / Centre / Right)"),
-    ("cfg_cc",      "Custom Controls (CC)"),
+    # These four were shown here before but did nothing (nothing of the
+    # control surface was synced, stored or recalled). Now each covers a
+    # real part of the console -- see _path_to_cfg_item().
+    ("cfg_surface",    "Surface  (backlight, LEDs, meters, scribble strips -- $ctl/cfg/lights, RTA display)"),
+    ("cfg_prefs",      "Preferences  (solo/select behaviour, fader paging, spill, SOF, user button mode -- $ctl/cfg)"),
+    ("cfg_layers",     "Layers  (Left / Centre / Right fader layers -- what sits on every fader)"),
+    ("cfg_cc",         "Custom Controls (CC)  (user buttons and encoders -- $ctl/user)"),
+    ("cfg_config",     "Config  (talkback, monitor, solo bus, meters, RTA, main link, DCA mute groups -- /cfg)"),
+    ("cfg_mutegroups", "Mute groups  (mute state and names of mute groups 1–8)"),
 ]
+
+# Defaults for the cfg items in cues that were saved before an item existed
+CFG_ITEM_BASE_DEFAULTS = {"cfg_src_names": True}
+
+
+def _path_to_cfg_item(path):
+    """Which Console Config item covers a path, or None (not recalled)."""
+    if path.startswith('/io/in/') and path.endswith('/name'):
+        return 'cfg_src_names'
+    if path.startswith('/$ctl/cfg/lights/') or path.startswith('/$ctl/cfg/rta/'):
+        return 'cfg_surface'
+    if path.startswith('/$ctl/cfg/'):
+        return 'cfg_prefs'
+    if path.startswith('/$ctl/layer/'):
+        return 'cfg_layers'
+    if path.startswith('/$ctl/user/'):
+        return 'cfg_cc'
+    if path.startswith('/cfg/'):
+        return 'cfg_config'
+    if path.startswith('/mgrp/'):
+        return 'cfg_mutegroups'
+    return None
+
+
+def _is_internal_path(text):
+    """Wing's internal/read-only values have a '$' in the name ($fname,
+    $state, $stat ...). The control-surface tree itself is called '$ctl',
+    so that one prefix is allowed."""
+    return '$' in text.replace('/$ctl/', '/')
 
 # Defaults for FX and Config scope -- defined here so FX_SLOTS/CFG_ITEMS exist
 # These are mutable at runtime via the Default Scope dialog
@@ -310,7 +355,8 @@ DEFAULT_GROUP_FADES = {gk: {"fader": 0.0, "sends": 0.0} for gk, _, _ in SCOPE_PA
 # Wing OSC path mapping constants -- inserted after DEFAULT_GROUP_FADES
 
 WING_CH_PATHS = {}
-for _i in range(48): WING_CH_PATHS[f"input_{_i+1:02d}"] = f"/ch/{_i+1}"
+for _i in range(40): WING_CH_PATHS[f"input_{_i+1:02d}"] = f"/ch/{_i+1}"
+for _i in range(8):  WING_CH_PATHS[f"aux_{_i+1:02d}"]   = f"/aux/{_i+1}"
 for _i in range(16): WING_CH_PATHS[f"bus_{_i+1:02d}"]   = f"/bus/{_i+1}"
 for _i in range(8):  WING_CH_PATHS[f"matrix_{_i+1:02d}"]= f"/mtx/{_i+1}"
 for _i in range(4):  WING_CH_PATHS[f"main_{_i+1}"]      = f"/main/{_i+1}"
@@ -391,7 +437,8 @@ class Section:
             elif v is False: migrated[k] = "all"
             else:            migrated[k] = v
         s.exclusions = migrated
-        s.channels = d.get("channels", [])
+        # main_01 -> main_1 (sections saved by older versions)
+        s.channels = [re.sub(r"^main_0(\d)$", r"main_\1", c) for c in d.get("channels", [])]
         return s
 
 
@@ -480,8 +527,9 @@ class Snapshot:
                             for k,v in d.get("channel_scopes",{}).items()}
         s.fx_scope    = d.get("fx_scope",  {k: True  for k,_ in FX_SLOTS})
         s.cfg_scope   = d.get("cfg_scope", {k: False for k,_ in CFG_ITEMS})
-        # Cues saved before "Input source names" existed: on, as default
-        s.cfg_scope.setdefault("cfg_src_names", True)
+        # Items added after the cue was saved: their base default
+        for k, _ in CFG_ITEMS:
+            s.cfg_scope.setdefault(k, CFG_ITEM_BASE_DEFAULTS.get(k, False))
         s.group_fades = d.get("group_fades", {})
         s.osc_messages = d.get("osc_messages", [])
         return s
@@ -1424,7 +1472,9 @@ class WingOSC(QObject):
                 if not getattr(self, '_wingmon_running', False):
                     break
                 line = line.strip()
-                if not line or '$' in line:
+                # Skip Wing-internal values ('$' in the PATH -- a '$' in a
+                # value, e.g. a channel name, is fine)
+                if not line or _is_internal_path(line.split(' =', 1)[0]):
                     continue
 
                 # ── Check for connection confirmation ─────────────────────────
@@ -1729,7 +1779,7 @@ class WingOSC(QObject):
             # An input SOURCE was renamed -- any channel patched to it (and
             # without its own name) shows that name. Refresh all rows.
             self.name_changed.emit("", "")
-        elif (len(parts) == 6 and parts[1] == 'ch' and parts[3] == 'in'
+        elif (len(parts) == 6 and parts[1] in ('ch', 'aux') and parts[3] == 'in'
               and parts[4] == 'conn' and parts[5] in ('grp', 'in')):
             # Channel repatched to another source -> its shown name may change.
             ck = self._path_to_ch_key(path)
@@ -2089,12 +2139,14 @@ class WingOSC(QObject):
         threading.Thread(target=_send_batches, daemon=True, name="RecallBatch").start()
 
     def _path_in_scope(self, path, snapshot):
-        # Input source names -- Console Config -> "Input source names".
-        # Nothing else under /io is ever recalled.
-        if path.startswith('/io/'):
-            if path.startswith('/io/in/') and path.endswith('/name'):
-                return bool(snapshot.cfg_scope.get('cfg_src_names', True))
-            return False
+        # Console Config items (source names, surface, preferences, layers,
+        # custom controls, config, mute groups). Anything else outside the
+        # channel tree (/io preamps, $ctl/safes, gpio ...) is never recalled.
+        if path.startswith(('/io/', '/$ctl/', '/cfg/', '/mgrp/')):
+            item = _path_to_cfg_item(path)
+            if not item:
+                return False
+            return bool(snapshot.cfg_scope.get(item, CFG_ITEM_BASE_DEFAULTS.get(item, False)))
         ch_key    = self._path_to_ch_key(path)
         scope_key = self._path_to_scope_key(path)
         if not ch_key or not scope_key:
@@ -2130,6 +2182,7 @@ class WingOSC(QObject):
         try:    num = int(num_s)
         except: return None
         if kind == 'ch':   return f"input_{num:02d}"
+        if kind == 'aux':  return f"aux_{num:02d}"
         if kind == 'bus':  return f"bus_{num:02d}"
         if kind == 'fx':   return f"fx_{num:02d}"
         if kind == 'mtx':  return f"matrix_{num:02d}"
@@ -2160,6 +2213,7 @@ class WingOSC(QObject):
         if sub.startswith('/send'):                          return 'sends'
         if sub.startswith('/in/conn'):                       return 'conn'
         if sub.startswith('/in/set/dly'):                    return 'delay'
+        if sub.startswith('/dir/'):                          return 'in'   # matrix direct input
         if sub in ('/trim', '/pol') or sub.startswith('/in/set'): return 'in'
         if sub in ('/name', '/icon', '/col', '/led'):   return 'custom'
         if sub == '/tags':                                   return 'tags'
@@ -2180,6 +2234,7 @@ class WingOSC(QObject):
 
     def _ch_key_to_group(self, ch_key):
         if ch_key.startswith('input'):  return 'inputs'
+        if ch_key.startswith('aux'):    return 'aux'
         if ch_key.startswith('bus'):    return 'buses'
         if ch_key.startswith('matrix'): return 'matrix'
         if ch_key.startswith('main'):   return 'mains'
@@ -3554,7 +3609,7 @@ class RecallScopeWidget(QWidget):
                     cs_ck = (self.snapshot.channel_scopes[ck]
                              if ck in self.snapshot.channel_scopes else None)
                     fallback = cs_ck.overrides.get(sk, global_val) if cs_ck else global_val
-                    if (ck.startswith('input_') or ck.startswith('bus_')) and cs_ck and cs_ck.send_overrides:
+                    if _has_sends(ck) and cs_ck and cs_ck.send_overrides:
                         vals.extend(cs_ck.send_overrides.get(d, fallback) for d in SEND_DEST_KEYS)
                     else:
                         vals.append(fallback)
@@ -3579,7 +3634,7 @@ class RecallScopeWidget(QWidget):
         # the buses group have real per-send data (channels/buses send to
         # buses AND directly to matrix outputs). Other groups (matrix,
         # mains, DCAs) show " --", same as their existing non-applicable columns.
-        is_inputs_or_buses_group = group_key in ("inputs", "buses")
+        is_inputs_or_buses_group = group_key in SEND_GROUPS
         global_sends_val = global_scope.get('sends', True)
         for i, dest in enumerate(SEND_DEST_KEYS):
             col = SEND_FIRST_COL + i
@@ -3646,8 +3701,8 @@ class RecallScopeWidget(QWidget):
         name = self._state_value(path)
         if name not in (None, ""):
             return str(name).strip()
-        if ch_key.startswith("input_"):
-            base = path[:-len("/name")]                 # /ch/N
+        if ch_key.startswith(("input_", "aux_")):
+            base = path[:-len("/name")]                 # /ch/N or /aux/N
             grp  = self._state_value(f"{base}/in/conn/grp")
             num  = self._state_value(f"{base}/in/conn/in")
             if grp not in (None, "", "OFF") and num not in (None, ""):
@@ -3718,7 +3773,7 @@ class RecallScopeWidget(QWidget):
             if is_dca and sk not in DCA_APPLICABLE:
                 item.setText(col, " --")
                 item.setForeground(col, QColor(C['text3']))
-            elif sk == 'sends' and (ch_key.startswith('input_') or ch_key.startswith('bus_')):
+            elif sk == 'sends' and _has_sends(ch_key):
                 # The aggregate Sends circle should reflect the REAL state
                 # of every individual bus/matrix override, same as any
                 # other aggregate circle -- partial (half circle) when
@@ -3743,7 +3798,7 @@ class RecallScopeWidget(QWidget):
         # directly to matrix outputs; buses can send to other buses and to
         # matrix outputs too. Both row kinds get real data here. Other row
         # kinds (matrix/main/dca rows themselves) show " --".
-        is_input = ch_key.startswith("input_")
+        is_input = ch_key.startswith(("input_", "aux_"))
         is_bus   = ch_key.startswith("bus_")
         global_sends_val = global_scope.get('sends', True)
         for i, dest in enumerate(SEND_DEST_KEYS):
@@ -3821,7 +3876,7 @@ class RecallScopeWidget(QWidget):
                     cs.overrides[sk] = new_val
                 else:
                     cs.overrides.pop(sk, None)
-                if sk == 'sends' and (ck.startswith('input_') or ck.startswith('bus_')):
+                if sk == 'sends' and _has_sends(ck):
                     # The aggregate Sends toggle should mean ALL sends,
                     # including every individually-customised bus/matrix
                     # override -- not just the fallback flag those defer to.
@@ -3859,7 +3914,7 @@ class RecallScopeWidget(QWidget):
             else:
                 cs.overrides.pop(sk, None)
             new_circ_ch = CIRCLE_ON if new_val else CIRCLE_OFF
-            if sk == 'sends' and (ck.startswith('input_') or ck.startswith('bus_')):
+            if sk == 'sends' and _has_sends(ck):
                 for dest in SEND_DEST_KEYS:
                     cs.send_overrides[dest] = new_val
                 for i in range(len(SEND_DEST_KEYS)):
@@ -3883,7 +3938,7 @@ class RecallScopeWidget(QWidget):
         global_val = self.snapshot.scope.get('sends', True)
 
         if data["type"] == "group":
-            if data.get("key") not in ("inputs", "buses"):
+            if data.get("key") not in SEND_GROUPS:
                 return   # " --" cells (matrix/DCA groups) aren't interactive
             current  = item.data(col, CIRCLE_ROLE)
             new_val  = (current != CIRCLE_ON)
@@ -3900,7 +3955,7 @@ class RecallScopeWidget(QWidget):
 
         elif data["type"] == "channel":
             ck = data["key"]
-            if not (ck.startswith("input_") or ck.startswith("bus_")):
+            if not _has_sends(ck):
                 return
             cs      = self.snapshot.get_ch_scope(ck)
             current = item.data(col, CIRCLE_ROLE)
@@ -3936,7 +3991,7 @@ class RecallScopeWidget(QWidget):
                     continue
                 cs_ck = self.snapshot.channel_scopes.get(ck)
                 fallback = cs_ck.overrides.get(sk, global_val) if cs_ck else global_val
-                if (ck.startswith('input_') or ck.startswith('bus_')) and cs_ck and cs_ck.send_overrides:
+                if _has_sends(ck) and cs_ck and cs_ck.send_overrides:
                     vals.extend(cs_ck.send_overrides.get(d, fallback) for d in SEND_DEST_KEYS)
                 else:
                     vals.append(fallback)
@@ -3960,7 +4015,7 @@ class RecallScopeWidget(QWidget):
         if not parent:
             return
         data = parent.data(LABEL_COL, Qt.ItemDataRole.UserRole)
-        if not data or data.get("key") not in ("inputs", "buses"):
+        if not data or data.get("key") not in SEND_GROUPS:
             return
         global_val = self.snapshot.scope.get('sends', True)
         vals = []
@@ -4056,7 +4111,7 @@ class RecallScopeWidget(QWidget):
         global_val = self.snapshot.scope.get('sends', True)
         if data["type"] == "channel":
             ck = data["key"]
-            if not (ck.startswith("input_") or ck.startswith("bus_")):
+            if not _has_sends(ck):
                 return
             cs = self.snapshot.channel_scopes.get(ck)
             fallback = cs.overrides.get('sends', global_val) if cs else global_val
@@ -4065,7 +4120,7 @@ class RecallScopeWidget(QWidget):
             else:
                 vals = [fallback]
         elif data["type"] == "group":
-            if data.get("key") not in ("inputs", "buses"):
+            if data.get("key") not in SEND_GROUPS:
                 return
             vals = []
             for ck in data.get("children", []):
@@ -4153,7 +4208,7 @@ class RecallScopeWidget(QWidget):
                 child = grp.child(j)
                 d = child.data(LABEL_COL, Qt.ItemDataRole.UserRole)
                 ck = d.get("key", "") if d else ""
-                if not (ck.startswith("input_") or ck.startswith("bus_")):
+                if not _has_sends(ck):
                     continue
                 cs = self.snapshot.channel_scopes.get(ck)
                 val = (cs.send_overrides.get(dest, cs.overrides.get('sends', global_val))
@@ -4165,7 +4220,7 @@ class RecallScopeWidget(QWidget):
                 break
         new_val = not any_on
         for ch_key, cs in self.snapshot.channel_scopes.items():
-            if ch_key.startswith("input_") or ch_key.startswith("bus_"):
+            if _has_sends(ch_key):
                 cs.send_overrides[dest] = new_val
         self._rebuild(restore_expansion=True)
         self.scope_changed.emit()
@@ -5204,10 +5259,11 @@ class SectionsPanel(QWidget):
         ch_tabs.setCornerWidget(corner, Qt.Corner.TopRightCorner)
 
         self._ch_tabs_btns = []   # [(key_list, btn_list)] per tab -- for corner buttons
-        self.ch_btns_input  = self._ch_grid(ch_tabs, "Inputs (1–48)", 48, "input_",  16)
+        self.ch_btns_input  = self._ch_grid(ch_tabs, "Inputs (1–40)", 40, "input_",  10)
+        self.ch_btns_aux    = self._ch_grid(ch_tabs, "Aux (1–8)",      8, "aux_",     8)
         self.ch_btns_bus    = self._ch_grid(ch_tabs, "Buses (1–16)",  16, "bus_",     8)
         self.ch_btns_matrix = self._ch_grid(ch_tabs, "Matrix (1–8)",   8, "matrix_",  8)
-        self.ch_btns_mains  = self._ch_grid(ch_tabs, "Mains (1–4)",    4, "main_",    4)
+        self.ch_btns_mains  = self._ch_grid(ch_tabs, "Mains (1–4)",    4, "main_",    4, pad=False)
         self.ch_btns_dca    = self._ch_grid(ch_tabs, "DCAs (1–16)",   16, "dca_",     8)
         self.ch_btns_fx     = self._ch_grid(ch_tabs, "FX Racks (1–16)", 16, "fx_",   8)
         # Wire corner buttons to act on whichever tab is currently visible
@@ -5226,7 +5282,7 @@ class SectionsPanel(QWidget):
 
         self._refresh_list(); self._set_right_enabled(False)
 
-    def _ch_grid(self, tabs, label, count, prefix, cols):
+    def _ch_grid(self, tabs, label, count, prefix, cols, pad=True):
         tab = QWidget()
         outer = QVBoxLayout(tab)
         outer.setContentsMargins(8, 8, 8, 8)
@@ -5236,7 +5292,9 @@ class SectionsPanel(QWidget):
         g.setSpacing(4); g.setContentsMargins(0, 0, 0, 0)
         btns = []
         for i in range(count):
-            key = f"{prefix}{i+1:02d}"; num = i+1
+            # Mains are keyed main_1..main_4 everywhere else (not main_01) --
+            # the padded key here meant a section's Mains never matched.
+            key = f"{prefix}{i+1:02d}" if pad else f"{prefix}{i+1}"; num = i+1
             btn = QPushButton(f"{num:02d}"); btn.setCheckable(True)
             btn.setFixedSize(40,26); btn.setStyleSheet("font-size:11px;padding:0;")
             btn.clicked.connect(lambda _,k=key: self._toggle_ch(k))
@@ -5256,7 +5314,7 @@ class SectionsPanel(QWidget):
         self._ch_tabs.setEnabled(e)
         for b in getattr(self, '_sel_btns', []):
             b.setEnabled(e)
-        for lst in [self.ch_btns_input, self.ch_btns_bus, self.ch_btns_matrix,
+        for lst in [self.ch_btns_input, self.ch_btns_aux, self.ch_btns_bus, self.ch_btns_matrix,
                     self.ch_btns_mains, self.ch_btns_dca, self.ch_btns_fx]:
             for _,btn in lst: btn.setEnabled(e)
 
@@ -5291,7 +5349,7 @@ class SectionsPanel(QWidget):
 
 
     def _refresh_chs(self, sec):
-        for lst in [self.ch_btns_input, self.ch_btns_bus, self.ch_btns_matrix,
+        for lst in [self.ch_btns_input, self.ch_btns_aux, self.ch_btns_bus, self.ch_btns_matrix,
                     self.ch_btns_mains, self.ch_btns_dca, self.ch_btns_fx]:
             for key,btn in lst:
                 in_sec = key in sec.channels; btn.setChecked(in_sec)
@@ -7501,6 +7559,13 @@ def run_selftest(out_dir):
         ("/ch/2/name",              "DATA /ch/2/name =",                      ""),
         ("/io/in/A/1/name",         "DATA /io/in/A/1/name = KEYS",            "KEYS"),
         ("/io/in/LCL/3/name",       "DATA /io/in/LCL/3/name = ROOM L",        "ROOM L"),
+        ("/aux/1/fdr",              "DATA /aux/1/fdr = -4.5",                 "-4.5"),
+        ("/aux/1/name",             "DATA /aux/1/name = PLAYBACK",            "PLAYBACK"),
+        ("/mtx/1/dir/lvl",          "DATA /mtx/1/dir/lvl = -20.0",            "-20.0"),
+        ("/mgrp/1/mute",            "DATA /mgrp/1/mute = 1",                  "1"),
+        ("/cfg/mainlink",           "DATA /cfg/mainlink = OFF",               "OFF"),
+        ("/$ctl/cfg/lights/btns",   "DATA /$ctl/cfg/lights/btns = 50",        "50"),
+        ("/$ctl/layer/L/1/name",    "DATA /$ctl/layer/L/1/name = VOCALS",     "VOCALS"),
         ("/ch/1/eq/mdl",            "DATA /ch/1/eq/mdl = STD",                "STD"),
         ("/ch/1/eq/#a1b2c3d4",      "DATA ch/1:eq:prop7#a1b2c3d4 = 1234.567", "1234.567"),
         ("/ch/1/gate/#0a0b0c0d",    "DATA ch/1:gate:prop3#0a0b0c0d = 80",     "80"),
@@ -7522,7 +7587,7 @@ def run_selftest(out_dir):
         osc._wingmon_loop(-1)                 # parse exactly like a real sync
         snap = Snapshot("Round trip", 99)
         snap.scope = {k: True for k in WING_SCOPE_KEYS}
-        snap.cfg_scope = dict(snap.cfg_scope, cfg_src_names=True)
+        snap.cfg_scope = {k: True for k, _ in CFG_ITEMS}
         snap.channel_scopes = {}
         snap.group_fades = {}
         with osc._wing_state_lock:
@@ -7626,8 +7691,26 @@ def run_selftest(out_dir):
         old = Snapshot.from_dict({"name": "old", "cfg_scope": {"cfg_surface": False}})
         if not old.cfg_scope.get("cfg_src_names"):
             raise AssertionError("cues from older show files don't recall source names")
-        return "on/off respected, older cues default to on, only names under /io"
-    check("input source names (Console Config switch)", t_source_names_switch)
+        if old.cfg_scope.get("cfg_layers") is not False:
+            raise AssertionError("new items must default to off in older cues")
+        # Every other Console Config item: off = not sent, on = sent
+        samples = {"cfg_surface": "/$ctl/cfg/lights/btns", "cfg_prefs": "/$ctl/cfg/soloexcl",
+                   "cfg_layers": "/$ctl/layer/L/1/name", "cfg_cc": "/$ctl/user/mode",
+                   "cfg_config": "/cfg/mainlink", "cfg_mutegroups": "/mgrp/1/mute"}
+        for item, p in samples.items():
+            sn = Snapshot("cfg", 97); sn.group_fades = {}
+            sn.data = {p: "1", "/$ctl/safes/ch": "x", "/$stat/time": "x"}
+            sn.cfg_scope = {k: False for k, _ in CFG_ITEMS}
+            if p in " ".join(recall(sn, {}).sent()):
+                raise AssertionError(f"{item}: recalled while switched off")
+            sn.cfg_scope[item] = True
+            out = " ".join(recall(sn, {}).sent())
+            if p not in out:
+                raise AssertionError(f"{item}: not recalled while switched on")
+            if "safes" in out or "$stat" in out:
+                raise AssertionError("something outside Console Config was recalled")
+        return "all 7 Console Config items: on = recalled, off = left alone"
+    check("Console Config switches (source names, surface, prefs, layers, CC, config, mute groups)", t_source_names_switch)
     osc._wingmon_proc = None
 
     def t_old_show_types():

@@ -7,6 +7,20 @@
   never sent back, so a cue could not change the names on the console. New switch in Recall Scope →
   **Console Config → Input source names** (on by default, also for cues in existing show files).
 - Self-test: source names are part of the "values in = values out" check, and the switch is tested on/off.
+- **Console Config works.** Surface, Preferences, Layers and Custom Controls were shown but did nothing –
+  nothing of the control surface was synced, stored or recalled. Now each covers its real part of the console
+  (`$ctl/cfg` lights/RTA, `$ctl/cfg` behaviour, `$ctl/layer`, `$ctl/user`), plus two new items: **Config**
+  (talkback, monitor, solo, meters, RTA, main link – `/cfg`) and **Mute groups** (state and names). Off by
+  default; older cues need an *Update from Wing* to contain this data.
+- **Aux inputs 1–8.** The Wing has 40 input channels + 8 Aux inputs. Recall Scope showed "Input Ch 41–48", which
+  don't exist on the console, while the Aux inputs were not synced, stored or recalled at all. They now have
+  their own group (with sends, fades, names and Auto Update sections).
+- Matrix direct input (on, level, invert, source) is covered by the **In** column; it was not recalled before.
+- Auto Update sections restricted to specific Mains never matched (the buttons used `main_01`, everything else
+  `main_1`); fixed, and older sections are converted.
+- A channel/source name containing `$` is no longer dropped.
+- Self-test: every Console Config item is tested on/off, and Aux, matrix direct input, mute groups, `/cfg` and
+  `$ctl` values are part of "values in = values out" (23 values, app and bytes to the Wing).
 
 ## 1.9.12 – 2026-11-01
 

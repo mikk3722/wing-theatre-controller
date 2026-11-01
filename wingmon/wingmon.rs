@@ -5,12 +5,19 @@ use std::io::{BufRead, Write};
 use std::sync::mpsc;
 use libwing::{WingConsole, WingResponse, WingNodeData};
 
+/// Wing's internal/read-only values have a '$' in the name ($fname, $state,
+/// $stat ...). The control-surface tree itself is called "$ctl", so that one
+/// prefix is allowed -- layers, user controls and surface settings live there.
+fn is_internal(name: &str) -> bool {
+    name.replace("/$ctl/", "/").contains('$')
+}
+
 fn print_node(tx: &mpsc::Sender<String>, prefix: &str, id: i32, val: &str) {
     match WingConsole::id_to_defs(id) {
         None => {}
         Some(defs) if defs.is_empty() => {}
         Some(defs) if defs.len() == 1 => {
-            if !defs[0].0.contains('$') {
+            if !is_internal(&defs[0].0) {
                 tx.send(format!("{}{} = {}", prefix, defs[0].0, val)).ok();
             }
         }
@@ -220,6 +227,14 @@ mod encode_tests {
     }
 
     #[test]
+    fn internal_names() {
+        assert!(!is_internal("/$ctl/layer/L/1/name"));
+        assert!(!is_internal("/ch/1/fdr"));
+        assert!(is_internal("/$ctl/user/gpio/1/bu/$fname"));
+        assert!(is_internal("/$stat/time"));
+    }
+
+    #[test]
     fn strings() {
         assert_eq!(encode_param("#01020304", "").unwrap(), vec![0xd7, 1, 2, 3, 4, 0xd0]);
         assert_eq!(encode_param("#01020304", "BD").unwrap(), vec![0xd7, 1, 2, 3, 4, 0x81, b'B', b'D']);
@@ -301,14 +316,23 @@ fn main() -> Result<(), libwing::Error> {
     }
     eprintln!("[wingmon] SYNC: {} input source nodes", io_paths.len());
 
+    // The Wing has 40 input channels + 8 Aux inputs (/aux/N). Plus the
+    // parts of the console that Recall Scope -> Console Config covers:
+    // audio config (/cfg), surface/preferences ($ctl/cfg), fader layers
+    // ($ctl/layer), custom controls ($ctl/user) and the mute groups.
+    let console_nodes = ["/cfg", "/$ctl/cfg", "/$ctl/layer", "/$ctl/user"];
     let sync_paths: Vec<String> =
-        (1..=48).map(|i| format!("/ch/{}", i))
+        (1..=40).map(|i| format!("/ch/{}", i))
+        .chain((1..=8).map(|i|  format!("/aux/{}", i)))
         .chain((1..=16).map(|i| format!("/bus/{}", i)))
         .chain((1..=4).map(|i|  format!("/main/{}", i)))
         .chain((1..=8).map(|i|  format!("/mtx/{}", i)))
         .chain((1..=16).map(|i| format!("/dca/{}", i)))
         .chain((1..=16).map(|i| format!("/fx/{}", i)))
+        .chain((1..=8).map(|i|  format!("/mgrp/{}", i)))
+        .chain(console_nodes.iter().map(|p| p.to_string()))
         .chain(io_paths.into_iter())
+        .filter(|p| WingConsole::name_to_id(p).is_some())
         .collect();
 
     let mut total = 0usize;
