@@ -284,6 +284,13 @@ FX_SLOTS = [(f"fx_{i+1:02d}", f"FX Slot {i+1:02d}") for i in range(16)]
 
 # Console config items -- simple single on/off each (stored in snapshot.cfg_scope)
 CFG_ITEMS = [
+    # Input SOURCE names (/io/in/<group>/<n>/name). On the Wing a channel
+    # without its own name shows the name of the source it is patched to --
+    # and in most shows that is where the names live (channel names empty).
+    # These were stored in every cue but never recalled, so a cue could not
+    # change the names on the console. ON by default (also for cues saved
+    # before this item existed), like the channel Name column.
+    ("cfg_src_names", "Input source names  (Local / A / B / C / AES / USB … -- the names the channels show)"),
     ("cfg_surface", "Surface Layout"),
     ("cfg_prefs",   "Preferences"),
     ("cfg_layers",  "Layers  (Left / Centre / Right)"),
@@ -294,6 +301,7 @@ CFG_ITEMS = [
 # These are mutable at runtime via the Default Scope dialog
 DEFAULT_FX_SCOPE  = {k: True  for k, _ in FX_SLOTS}
 DEFAULT_CFG_SCOPE = {k: False for k, _ in CFG_ITEMS}
+DEFAULT_CFG_SCOPE["cfg_src_names"] = True
 
 # Default crossfade times per path group -- mutable at runtime via Default Scope dialog
 DEFAULT_GROUP_FADES = {gk: {"fader": 0.0, "sends": 0.0} for gk, _, _ in SCOPE_PATH_GROUPS}
@@ -472,6 +480,8 @@ class Snapshot:
                             for k,v in d.get("channel_scopes",{}).items()}
         s.fx_scope    = d.get("fx_scope",  {k: True  for k,_ in FX_SLOTS})
         s.cfg_scope   = d.get("cfg_scope", {k: False for k,_ in CFG_ITEMS})
+        # Cues saved before "Input source names" existed: on, as default
+        s.cfg_scope.setdefault("cfg_src_names", True)
         s.group_fades = d.get("group_fades", {})
         s.osc_messages = d.get("osc_messages", [])
         return s
@@ -2079,6 +2089,12 @@ class WingOSC(QObject):
         threading.Thread(target=_send_batches, daemon=True, name="RecallBatch").start()
 
     def _path_in_scope(self, path, snapshot):
+        # Input source names -- Console Config -> "Input source names".
+        # Nothing else under /io is ever recalled.
+        if path.startswith('/io/'):
+            if path.startswith('/io/in/') and path.endswith('/name'):
+                return bool(snapshot.cfg_scope.get('cfg_src_names', True))
+            return False
         ch_key    = self._path_to_ch_key(path)
         scope_key = self._path_to_scope_key(path)
         if not ch_key or not scope_key:
@@ -7483,6 +7499,8 @@ def run_selftest(out_dir):
         ("/ch/1/icon",              "DATA /ch/1/icon = 100",                  "100"),
         ("/ch/1/name",              "DATA /ch/1/name = Lead, Vox",            "Lead, Vox"),
         ("/ch/2/name",              "DATA /ch/2/name =",                      ""),
+        ("/io/in/A/1/name",         "DATA /io/in/A/1/name = KEYS",            "KEYS"),
+        ("/io/in/LCL/3/name",       "DATA /io/in/LCL/3/name = ROOM L",        "ROOM L"),
         ("/ch/1/eq/mdl",            "DATA /ch/1/eq/mdl = STD",                "STD"),
         ("/ch/1/eq/#a1b2c3d4",      "DATA ch/1:eq:prop7#a1b2c3d4 = 1234.567", "1234.567"),
         ("/ch/1/gate/#0a0b0c0d",    "DATA ch/1:gate:prop3#0a0b0c0d = 80",     "80"),
@@ -7504,6 +7522,7 @@ def run_selftest(out_dir):
         osc._wingmon_loop(-1)                 # parse exactly like a real sync
         snap = Snapshot("Round trip", 99)
         snap.scope = {k: True for k in WING_SCOPE_KEYS}
+        snap.cfg_scope = dict(snap.cfg_scope, cfg_src_names=True)
         snap.channel_scopes = {}
         snap.group_fades = {}
         with osc._wing_state_lock:
@@ -7589,6 +7608,27 @@ def run_selftest(out_dir):
             raise AssertionError("; ".join(bad))
         return f"{len(RT_IN)} values reach the Wing unchanged (type and value)"
     check("values in = values out (bytes to the Wing)", t_values_on_the_wire)
+
+    def t_source_names_switch():
+        snap = Snapshot("Sources", 98)
+        snap.data = {"/io/in/A/1/name": "KEYS", "/ch/1/name": "",
+                     "/io/in/A/1/mode": "M"}
+        snap.group_fades = {}
+        on = " ".join(recall(snap, {}).sent())
+        snap.cfg_scope["cfg_src_names"] = False
+        off = " ".join(recall(snap, {}).sent())
+        if "/io/in/A/1/name=KEYS" not in on:
+            raise AssertionError("source name not recalled with the switch on")
+        if "/io/in/A/1/name" in off:
+            raise AssertionError("source name recalled with the switch off")
+        if "/io/in/A/1/mode" in on:
+            raise AssertionError("a non-name /io parameter was recalled")
+        old = Snapshot.from_dict({"name": "old", "cfg_scope": {"cfg_surface": False}})
+        if not old.cfg_scope.get("cfg_src_names"):
+            raise AssertionError("cues from older show files don't recall source names")
+        return "on/off respected, older cues default to on, only names under /io"
+    check("input source names (Console Config switch)", t_source_names_switch)
+    osc._wingmon_proc = None
 
     def t_old_show_types():
         osc._ensure_float_keys()

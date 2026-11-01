@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.9.13 – 2026-11-01
+
+- **Input source names are recalled.** On the Wing a channel without its own name shows the name of the input
+  source it is patched to, and in most shows that is where the names live. They were stored in every cue but
+  never sent back, so a cue could not change the names on the console. New switch in Recall Scope →
+  **Console Config → Input source names** (on by default, also for cues in existing show files).
+- Self-test: source names are part of the "values in = values out" check, and the switch is tested on/off.
+
 ## 1.9.12 – 2026-11-01
 
 - **Values keep their exact type and value from Wing to Wing.** libwing printed a whole-number float without a
