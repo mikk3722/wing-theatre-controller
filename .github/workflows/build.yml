@@ -267,6 +267,10 @@ jobs:
   build-app-windows:
     runs-on: windows-latest
     needs: build-wingmon-windows
+    env:
+      # Windows signing only runs when the Azure secrets exist -- without
+      # them the build still succeeds, just unsigned (as before).
+      HAS_AZURE_SIGNING: ${{ secrets.AZURE_CLIENT_SECRET != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -299,6 +303,48 @@ jobs:
             --hidden-import PyQt6.sip `
             --hidden-import pythonosc `
             wing_theatre.py
+
+      # ── Code signing (Azure Artifact Signing, formerly Trusted Signing) ──
+      # Signs every .exe, .dll and .pyd in the build -- the app, the bundled
+      # wingmon.exe and every Python/Qt library -- with a timestamp, so the
+      # signature stays valid after the short-lived Azure certificate
+      # expires. Windows then shows the publisher name instead of "Unknown
+      # publisher", and Windows 11 Smart App Control (which checks every
+      # library the app loads, not just the .exe) lets it start.
+      - name: Sign app (Azure Artifact Signing)
+        if: env.HAS_AZURE_SIGNING == 'true'
+        uses: azure/artifact-signing-action@v2
+        with:
+          azure-tenant-id:          ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id:          ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret:      ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint:                 ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name:     ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_CERT_PROFILE }}
+          files-folder:             ${{ github.workspace }}\dist\Wing Theatre Controller
+          files-folder-filter:      exe,dll,pyd
+          files-folder-recurse:     true
+          file-digest:              SHA256
+          timestamp-rfc3161:        http://timestamp.acs.microsoft.com
+          timestamp-digest:         SHA256
+          description:              Wing Theatre Controller
+          description-url:          https://github.com/mikk3722/wing-theatre-controller
+
+      - name: Verify signatures
+        if: env.HAS_AZURE_SIGNING == 'true'
+        run: |
+          $bad = 0
+          $files = Get-ChildItem "dist\Wing Theatre Controller" -Recurse -File |
+                   Where-Object { $_.Extension -in '.exe', '.dll', '.pyd' }
+          foreach ($f in $files) {
+            $sig = Get-AuthenticodeSignature $f.FullName
+            if ($f.Extension -eq '.exe') {
+              Write-Host ("{0,-12} {1}  [{2}]" -f $sig.Status, $f.Name, $sig.SignerCertificate.Subject)
+            }
+            if ($sig.Status -ne 'Valid') { Write-Host "NOT SIGNED: $($f.FullName) ($($sig.Status))"; $bad++ }
+          }
+          Write-Host "$($files.Count) exe/dll/pyd files checked, $bad not validly signed"
+          if ($bad -gt 0) { Write-Error "$bad file(s) not validly signed"; exit 1 }
 
       - name: Create ZIP
         run: |
