@@ -282,13 +282,11 @@ def _ch_key_to_name_path(ch_key):
 
 
 def _snapshot_copy(state):
-    """Copy of the live Wing state for storing in a cue. Input-source nodes
-    (/io/...) are synced only so channel names can fall back to the source
-    name; nothing under /io is ever recalled (outside every Recall Scope
-    column), so only their names are kept -- no need to store preamp data
-    etc. in every single cue."""
+    """Copy of the live Wing state for storing in a cue. Of /io only the
+    input SOURCES are kept (name, colour, icon, mono/stereo, preamp) -- they
+    are recalled through Recall Scope -> Console Config."""
     return {p: v for p, v in state.items()
-            if not p.startswith('/io/') or p.endswith('/name')}
+            if not p.startswith('/io/') or p.startswith('/io/in/')}
 
 # FX slots -- simple single on/off per slot (stored in snapshot.fx_scope)
 FX_SLOTS = [(f"fx_{i+1:02d}", f"FX Slot {i+1:02d}") for i in range(16)]
@@ -301,7 +299,8 @@ CFG_ITEMS = [
     # These were stored in every cue but never recalled, so a cue could not
     # change the names on the console. ON by default (also for cues saved
     # before this item existed), like the channel Name column.
-    ("cfg_src_names", "Input source names  (Local / A / B / C / AES / USB … -- the names the channels show)"),
+    ("cfg_src_names",  "Input sources: name, colour, icon, mono/stereo  (Local / A / B / C / AES / USB …) + the console's 'show source name/colour' setting"),
+    ("cfg_src_preamp", "Input sources: preamp gain, phantom power, polarity, mute  (careful: phantom switching can pop)"),
     # These four were shown here before but did nothing (nothing of the
     # control surface was synced, stored or recalled). Now each covers a
     # real part of the console -- see _path_to_cfg_item().
@@ -317,9 +316,21 @@ CFG_ITEMS = [
 CFG_ITEM_BASE_DEFAULTS = {"cfg_src_names": True}
 
 
+_SRC_LOOK   = {'name', 'col', 'icon', 'mode'}
+_SRC_PREAMP = {'g', 'vph', 'pol', 'mute'}
+
+
 def _path_to_cfg_item(path):
     """Which Console Config item covers a path, or None (not recalled)."""
-    if path.startswith('/io/in/') and path.endswith('/name'):
+    if path.startswith('/io/in/'):
+        leaf = path.rsplit('/', 1)[-1]
+        if path.count('/') == 5:                 # /io/in/<group>/<n>/<leaf>
+            if leaf in _SRC_LOOK:
+                return 'cfg_src_names'
+            if leaf in _SRC_PREAMP:
+                return 'cfg_src_preamp'
+        return None
+    if path == '/$ctl/$globals/srcdisp':         # "show source name/colour on strips"
         return 'cfg_src_names'
     if path.startswith('/$ctl/cfg/lights/') or path.startswith('/$ctl/cfg/rta/'):
         return 'cfg_surface'
@@ -339,8 +350,9 @@ def _path_to_cfg_item(path):
 def _is_internal_path(text):
     """Wing's internal/read-only values have a '$' in the name ($fname,
     $state, $stat ...). The control-surface tree itself is called '$ctl',
-    so that one prefix is allowed."""
-    return '$' in text.replace('/$ctl/', '/')
+    so that one prefix is allowed -- plus the global 'source display'
+    setting, which lives under $ctl/$globals."""
+    return '$' in text.replace('/$ctl/$globals/srcdisp', '/srcdisp').replace('/$ctl/', '/')
 
 # Defaults for FX and Config scope -- defined here so FX_SLOTS/CFG_ITEMS exist
 # These are mutable at runtime via the Default Scope dialog
@@ -911,6 +923,17 @@ def open_in_file_manager(path):
         QDesktopServices.openUrl(QUrl.fromLocalFile(path))
     except Exception:
         pass
+
+
+def _find_icon_path():
+    """assets/icon.png (dev) or icon.png bundled next to the app."""
+    for base in (getattr(sys, '_MEIPASS', None),
+                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")):
+        if base:
+            p = os.path.join(base, "icon.png")
+            if os.path.isfile(p):
+                return p
+    return None
 
 
 def _find_wingmon_path():
@@ -2096,6 +2119,10 @@ class WingOSC(QObject):
                 return (5, path)
 
             def _is_model_select(path):
+                # Input source mono/stereo mode: changes how channels pair
+                # up, so it goes first together with the model selects.
+                if path.startswith('/io/in/') and path.endswith('/mode'):
+                    return True
                 if not path.endswith('/mdl'):
                     return False
                 parts = path.split('/')
@@ -7409,6 +7436,8 @@ def run_selftest(out_dir):
                 raise AssertionError(f"missing in the app: {p}")
         if sys.platform != 'win32' and not os.access(WingOSC.WINGMON_PATH, os.X_OK):
             raise AssertionError("wingmon is not executable")
+        if not _find_icon_path():
+            raise AssertionError("icon.png missing in the app")
         name = os.path.basename(WingOSC.WINGMON_PATH)
         if name not in ("wingmon", "wingmon.exe"):
             raise AssertionError(f"wingmon bundled under the wrong name: {name}")
@@ -7559,6 +7588,12 @@ def run_selftest(out_dir):
         ("/ch/2/name",              "DATA /ch/2/name =",                      ""),
         ("/io/in/A/1/name",         "DATA /io/in/A/1/name = KEYS",            "KEYS"),
         ("/io/in/LCL/3/name",       "DATA /io/in/LCL/3/name = ROOM L",        "ROOM L"),
+        ("/io/in/A/1/mode",         "DATA /io/in/A/1/mode = ST",              "ST"),
+        ("/io/in/A/1/col",          "DATA /io/in/A/1/col = 5",                "5"),
+        ("/io/in/A/1/icon",         "DATA /io/in/A/1/icon = 120",             "120"),
+        ("/io/in/A/1/g",            "DATA /io/in/A/1/g = 23.5",               "23.5"),
+        ("/io/in/A/1/vph",          "DATA /io/in/A/1/vph = 1",                "1"),
+        ("/$ctl/$globals/srcdisp",  "DATA /$ctl/$globals/srcdisp = 1",        "1"),
         ("/aux/1/fdr",              "DATA /aux/1/fdr = -4.5",                 "-4.5"),
         ("/aux/1/name",             "DATA /aux/1/name = PLAYBACK",            "PLAYBACK"),
         ("/mtx/1/dir/lvl",          "DATA /mtx/1/dir/lvl = -20.0",            "-20.0"),
@@ -7677,7 +7712,7 @@ def run_selftest(out_dir):
     def t_source_names_switch():
         snap = Snapshot("Sources", 98)
         snap.data = {"/io/in/A/1/name": "KEYS", "/ch/1/name": "",
-                     "/io/in/A/1/mode": "M"}
+                     "/io/in/A/1/rmt": "OFF", "/io/out/A/1/name": "x"}
         snap.group_fades = {}
         on = " ".join(recall(snap, {}).sent())
         snap.cfg_scope["cfg_src_names"] = False
@@ -7686,15 +7721,16 @@ def run_selftest(out_dir):
             raise AssertionError("source name not recalled with the switch on")
         if "/io/in/A/1/name" in off:
             raise AssertionError("source name recalled with the switch off")
-        if "/io/in/A/1/mode" in on:
-            raise AssertionError("a non-name /io parameter was recalled")
+        if "/io/in/A/1/rmt" in on or "/io/out/" in on:
+            raise AssertionError("an /io parameter outside Console Config was recalled")
         old = Snapshot.from_dict({"name": "old", "cfg_scope": {"cfg_surface": False}})
         if not old.cfg_scope.get("cfg_src_names"):
             raise AssertionError("cues from older show files don't recall source names")
         if old.cfg_scope.get("cfg_layers") is not False:
             raise AssertionError("new items must default to off in older cues")
         # Every other Console Config item: off = not sent, on = sent
-        samples = {"cfg_surface": "/$ctl/cfg/lights/btns", "cfg_prefs": "/$ctl/cfg/soloexcl",
+        samples = {"cfg_src_preamp": "/io/in/A/1/vph",
+                   "cfg_surface": "/$ctl/cfg/lights/btns", "cfg_prefs": "/$ctl/cfg/soloexcl",
                    "cfg_layers": "/$ctl/layer/L/1/name", "cfg_cc": "/$ctl/user/mode",
                    "cfg_config": "/cfg/mainlink", "cfg_mutegroups": "/mgrp/1/mute"}
         for item, p in samples.items():
@@ -7709,8 +7745,15 @@ def run_selftest(out_dir):
                 raise AssertionError(f"{item}: not recalled while switched on")
             if "safes" in out or "$stat" in out:
                 raise AssertionError("something outside Console Config was recalled")
-        return "all 7 Console Config items: on = recalled, off = left alone"
-    check("Console Config switches (source names, surface, prefs, layers, CC, config, mute groups)", t_source_names_switch)
+        # Source mono/stereo goes first (before the names), with the pause
+        sn = Snapshot("order", 96); sn.group_fades = {}
+        sn.data = {"/io/in/A/1/name": "KEYS", "/io/in/A/1/mode": "ST", "/ch/1/fdr": -5.0}
+        lines = recall(sn, {}).sent()
+        if not lines or "/io/in/A/1/mode=ST" not in lines[0] or "/io/in/A/1/name" in lines[0]:
+            raise AssertionError(f"source mode not sent first: {lines[:2]}")
+        n = len(CFG_ITEMS)
+        return f"all {n} Console Config items: on = recalled, off = left alone; source mode first"
+    check("Console Config switches (sources, preamps, surface, prefs, layers, CC, config, mute groups)", t_source_names_switch)
     osc._wingmon_proc = None
 
     def t_old_show_types():
@@ -7875,6 +7918,10 @@ def main():
     pal.setColor(QPalette.ColorRole.Highlight,       QColor(C['green']))
     pal.setColor(QPalette.ColorRole.HighlightedText, QColor(C['bg']))
     app.setPalette(pal); app.setStyleSheet(STYLESHEET)
+    icon_path = _find_icon_path()
+    if icon_path:
+        from PyQt6.QtGui import QIcon
+        app.setWindowIcon(QIcon(icon_path))      # window / taskbar icon
     if selftest_dir is not None:
         sys.exit(run_selftest(selftest_dir))
     w = MainWindow(); w.show()

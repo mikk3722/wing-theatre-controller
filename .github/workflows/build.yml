@@ -114,6 +114,8 @@ jobs:
             --add-data "bundle-bin/wingmon:." \
             --add-data "propmap.jsonl:." \
             --add-data "version.txt:." \
+            --add-data "assets/icon.png:." \
+            --icon "assets/icon.icns" \
             --hidden-import PyQt6.sip \
             --hidden-import pythonosc \
             --osx-bundle-identifier dk.mikkelpeterlarsen.wingtheatre \
@@ -311,6 +313,8 @@ jobs:
             --add-data "wingmon.exe;." `
             --add-data "propmap.jsonl;." `
             --add-data "version.txt;." `
+            --add-data "assets/icon.png;." `
+            --icon "assets/icon.ico" `
             --hidden-import PyQt6.sip `
             --hidden-import pythonosc `
             wing_theatre.py

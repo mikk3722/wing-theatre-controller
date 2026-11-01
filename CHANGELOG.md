@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.9.14 – 2026-11-01
+
+- **Input sources are recalled completely**: besides the name also colour, icon and **mono/stereo/M-S mode**
+  (sent first in the cue, before everything else, with a short pause like model changes), plus the console's
+  "show source name/colour on the strips" setting (`$ctl/$globals/srcdisp`). Previously only source names were
+  stored and recalled.
+- New Console Config item **Input source preamps**: gain, phantom, polarity, mute of the sources (off by default
+  – phantom switching can pop).
+- Cues now store all input source settings. Cues stored before need an *Update from Wing* to contain colours,
+  modes and preamps (their names are already there).
+- **App icon** (white W on green, T badge) on the macOS app, the Windows program, the installer, the window and
+  the taskbar.
+- Self-test: 29 values in = out (incl. source mode, colour, icon, gain, phantom, srcdisp), 8 Console Config
+  switches, source mode sent first, icon bundled.
+
 ## 1.9.13 – 2026-11-01
 
 - **Input source names are recalled.** On the Wing a channel without its own name shows the name of the input

@@ -31,6 +31,7 @@ ChangesAssociations=yes
 CloseApplications=yes
 RestartApplications=no
 UninstallDisplayIcon={app}\{#MyAppExe}
+SetupIconFile=..\assets\icon.ico
 UninstallDisplayName={#MyAppName}
 WizardStyle=modern
 Compression=lzma2/max

@@ -9,7 +9,10 @@ use libwing::{WingConsole, WingResponse, WingNodeData};
 /// $stat ...). The control-surface tree itself is called "$ctl", so that one
 /// prefix is allowed -- layers, user controls and surface settings live there.
 fn is_internal(name: &str) -> bool {
-    name.replace("/$ctl/", "/").contains('$')
+    // "/$ctl/$globals/srcdisp" = show source name/colour on the strips
+    name.replace("/$ctl/$globals/srcdisp", "/srcdisp")
+        .replace("/$ctl/", "/")
+        .contains('$')
 }
 
 fn print_node(tx: &mpsc::Sender<String>, prefix: &str, id: i32, val: &str) {
@@ -232,6 +235,8 @@ mod encode_tests {
         assert!(!is_internal("/ch/1/fdr"));
         assert!(is_internal("/$ctl/user/gpio/1/bu/$fname"));
         assert!(is_internal("/$stat/time"));
+        assert!(!is_internal("/$ctl/$globals/srcdisp"));
+        assert!(is_internal("/$ctl/$globals/$savenow"));
     }
 
     #[test]
@@ -320,7 +325,7 @@ fn main() -> Result<(), libwing::Error> {
     // parts of the console that Recall Scope -> Console Config covers:
     // audio config (/cfg), surface/preferences ($ctl/cfg), fader layers
     // ($ctl/layer), custom controls ($ctl/user) and the mute groups.
-    let console_nodes = ["/cfg", "/$ctl/cfg", "/$ctl/layer", "/$ctl/user"];
+    let console_nodes = ["/cfg", "/$ctl/cfg", "/$ctl/layer", "/$ctl/user", "/$ctl/$globals"];
     let sync_paths: Vec<String> =
         (1..=40).map(|i| format!("/ch/{}", i))
         .chain((1..=8).map(|i|  format!("/aux/{}", i)))
