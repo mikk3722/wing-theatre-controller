@@ -518,8 +518,19 @@ class ShowFile:
                 "osc_outputs":[o.to_dict() for o in self.osc_outputs],
                 "app_settings": self.app_settings}
 
-    def save(self, fp):
-        """Atomic save. Previously this opened the target with "w", which
+    BACKUP_KEEP = 30
+
+    def save(self, fp, backup=False):
+        """Atomic save, optionally keeping a backup of the previous version.
+
+        backup=True: before the file is replaced, the version on disk is
+        copied to "<show> backups/<show> YYYY-MM-DD HH-MM-SS.wts" next to
+        it (skipped if identical to the newest backup); only the newest
+        BACKUP_KEEP backups are kept. A failing backup never stops the
+        save itself -- the problem is returned as a message instead.
+        Returns None, or a warning text about the backup.
+
+        Atomic save. Previously this opened the target with "w", which
         truncates the existing file IMMEDIATELY -- if anything failed
         mid-write (an unserialisable value, disk full, app closed or power
         lost during an autosave), the show file was left half-written or
@@ -530,6 +541,12 @@ class ShowFile:
         fully intact until the new one is completely on disk."""
         text = json.dumps(self.to_dict(), indent=2)
         folder = os.path.dirname(os.path.abspath(fp))
+        backup_warning = None
+        if backup and os.path.isfile(fp):
+            try:
+                self._backup_previous(fp)
+            except Exception as e:
+                backup_warning = f"backup of the previous version failed: {e}"
         tmp = os.path.join(folder, f".{os.path.basename(fp)}.saving.tmp")
         try:
             with open(tmp, "w", encoding="utf-8") as f:
@@ -545,6 +562,38 @@ class ShowFile:
                 pass
             raise
         self.filepath = fp
+        return backup_warning
+
+    @classmethod
+    def backup_folder(cls, fp):
+        stem = os.path.splitext(os.path.basename(fp))[0]
+        return os.path.join(os.path.dirname(os.path.abspath(fp)), f"{stem} backups")
+
+    def _backup_previous(self, fp):
+        import shutil
+        stem = os.path.splitext(os.path.basename(fp))[0]
+        bdir = self.backup_folder(fp)
+        os.makedirs(bdir, exist_ok=True)
+        existing = sorted(f for f in os.listdir(bdir)
+                          if f.startswith(stem + " ") and f.endswith(".wts"))
+        if existing:
+            newest = os.path.join(bdir, existing[-1])
+            try:
+                if (os.path.getsize(newest) == os.path.getsize(fp)
+                        and open(newest, 'rb').read() == open(fp, 'rb').read()):
+                    return          # nothing changed since the last backup
+            except Exception:
+                pass
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d %H-%M-%S")
+        dest = os.path.join(bdir, f"{stem} {stamp}.wts")
+        shutil.copy2(fp, dest)
+        existing = sorted(f for f in os.listdir(bdir)
+                          if f.startswith(stem + " ") and f.endswith(".wts"))
+        for old in existing[:-self.BACKUP_KEEP]:
+            try:
+                os.remove(os.path.join(bdir, old))
+            except Exception:
+                pass
 
     @staticmethod
     def load(fp):
@@ -587,6 +636,7 @@ class RemoteTCPServer(QObject):
     Protocol (newline-delimited UTF-8):
       Client→Server:  GO / NEXT_GO / PREV_GO / SNAP_GO <n|name>
                       AU_ON / AU_OFF / AU_TOGGLE / ADD_SNAP [name] / GET_STATE
+                      CANCEL_FADE
       Server→Client:  STATE key=value
     """
     MAX_CLIENTS = 4
@@ -752,6 +802,59 @@ def _find_propmap_path():
     return os.path.join(base, 'propmap.jsonl')
 
 
+APP_NAME = "Wing Theatre Controller"
+
+# Separator between parameters in a BATCH_SET line to wingmon. Formerly a
+# comma -- which broke any recalled name/text containing a comma. The ASCII
+# "unit separator" control character never occurs in console names.
+BATCH_SEP = "\x1f"
+
+
+def log_folder():
+    """Folder for wing_theatre_log.txt and crash_log.txt, in the user's own
+    space -- never next to the app. Inside a signed macOS app bundle a new
+    file would break the signature Apple notarised, and under C:\\Program
+    Files a normal user may not write at all, so the log would silently
+    disappear.
+      macOS:   ~/Library/Logs/Wing Theatre Controller
+      Windows: %LOCALAPPDATA%\\Wing Theatre Controller\\Logs
+      Linux:   ~/.local/state/wing-theatre-controller"""
+    if sys.platform == 'darwin':
+        p = os.path.expanduser(f"~/Library/Logs/{APP_NAME}")
+    elif sys.platform == 'win32':
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        p = os.path.join(base, APP_NAME, "Logs")
+    else:
+        base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+        p = os.path.join(base, "wing-theatre-controller")
+    try:
+        os.makedirs(p, exist_ok=True)
+    except Exception:
+        pass
+    return p
+
+
+def _rotate_log(path, max_bytes=5 * 1024 * 1024):
+    """Keep a log from growing forever: once it passes max_bytes it is
+    renamed to <name>.old.txt (replacing the previous .old) at startup."""
+    try:
+        if os.path.getsize(path) > max_bytes:
+            root, ext = os.path.splitext(path)
+            os.replace(path, f"{root}.old{ext}")
+    except Exception:
+        pass
+
+
+def open_in_file_manager(path):
+    """Show a folder in Finder / Explorer."""
+    try:
+        from PyQt6.QtGui import QDesktopServices
+        from PyQt6.QtCore import QUrl
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+    except Exception:
+        pass
+
+
 def _find_wingmon_path():
     """Find wingmon binary — works in dev, PyInstaller, Windows and macOS."""
     import sys, os, shutil
@@ -900,6 +1003,10 @@ class WingOSC(QObject):
         # takes. "deadline" is only a safety fallback so a path can't stay
         # suppressed forever if the target is somehow never seen.
         self._fading_paths  = {}
+        # Mutes that belong to a fade down: (due_time, path, value), sent by
+        # the fade timer when due. Cleared by every new recall / Cancel fade.
+        self._pending_mutes = []
+        self._stdin_lock    = threading.Lock()
         self._unified_timer = QTimer(self)
         self._unified_timer.timeout.connect(self._unified_step)
         # Thread-safe signal routing
@@ -1086,6 +1193,10 @@ class WingOSC(QObject):
 
     def connect(self, ip, port=2223, local_ip="0.0.0.0"):
         """Connect to Wing via wingmon TCP. No OSC socket needed."""
+        # A previous attempt may still be running (Wing unreachable, or a
+        # reconnect attempt) -- never leave two wingmon processes alive.
+        if getattr(self, '_wingmon_proc', None):
+            self._stop_wingmon()
         self.ip       = ip
         self.port     = port
         self.local_ip = local_ip
@@ -1199,8 +1310,10 @@ class WingOSC(QObject):
                 self._wingmon_proc = None
                 return
 
+            self._wm_gen = getattr(self, '_wm_gen', 0) + 1
             threading.Thread(
-                target=self._wingmon_loop, daemon=True, name="WingMon"
+                target=self._wingmon_loop, args=(self._wm_gen,),
+                daemon=True, name="WingMon"
             ).start()
             self.log_message.emit("wingmon running -- real-time Wing state tracking active")
             # Keepalive is handled inside wingmon itself (every 4s, independent
@@ -1254,7 +1367,7 @@ class WingOSC(QObject):
             return val_str
 
 
-    def _wingmon_loop(self):
+    def _wingmon_loop(self, gen=None):
         """
         Read wingmon stdout. Handles:
         - DATA /path = value   -> capture response (TCP GET)
@@ -1569,11 +1682,14 @@ class WingOSC(QObject):
         except Exception:
             pass
         finally:
-            self.synced = False
-            if self.is_connected:
-                self.is_connected = False
-                self.connected.emit(False)
-                self.log_message.emit("⚠ wingmon disconnected -- Wing connection lost")
+            # A reader for an OLD wingmon (replaced by a reconnect) must not
+            # touch the state of the new connection.
+            if gen is None or gen == getattr(self, '_wm_gen', gen):
+                self.synced = False
+                if self.is_connected:
+                    self.is_connected = False
+                    self.connected.emit(False)
+                    self.log_message.emit("⚠ wingmon disconnected -- Wing connection lost")
 
     def _emit_wing_event(self, path, value):
         """Store Wing event in _wing_state. Always updated, AU only writes to snapshot."""
@@ -1658,14 +1774,22 @@ class WingOSC(QObject):
     # ── Subscription ─────────────────────────────────────────────────────────
 
     def _wingmon_stdin(self, cmd: str):
-        """Send a command to wingmon via stdin (SET/GET/KEEPALIVE)."""
+        """Send one command line to wingmon via stdin (BATCH_SET/SET/KEEPALIVE).
+
+        Every write goes through this one function under a lock: a recall
+        sends its batches from a background thread while the fade timer
+        sends a BATCH_SET from the main thread every 25 ms. Without the
+        lock two writers could interleave inside one line, and wingmon
+        would receive a corrupted command."""
         proc = getattr(self, '_wingmon_proc', None)
         if proc and proc.stdin:
-            try:
-                proc.stdin.write(cmd if cmd.endswith('\n') else cmd + '\n')
-                proc.stdin.flush()
-            except Exception:
-                pass
+            line = cmd if cmd.endswith('\n') else cmd + '\n'
+            with self._stdin_lock:
+                try:
+                    proc.stdin.write(line)
+                    proc.stdin.flush()
+                except Exception:
+                    pass
 
     def _wingmon_running_ok(self) -> bool:
         proc = getattr(self, '_wingmon_proc', None)
@@ -1717,11 +1841,17 @@ class WingOSC(QObject):
         then all other in-scope params sorted by dependency order."""
         self._cancel_all_fades()
 
-        # Build param list: (dot_path, value_str, is_priority)
-        params = []     # (dot_path_str, is_priority)
-        delayed_cmds = []
+        # Build param list: (path, value_str, is_priority)
+        params = []
         faded_paths = set()
+        import time as _time
+        now = _time.time()
 
+        # Pass 1: fades, and the mute that belongs to each faded fader.
+        # Done before the instant parameters (pass 2) so a mute handled
+        # here is never ALSO sent immediately -- previously that depended
+        # on whether /mute happened to come before or after /fdr in the
+        # cue's data, and a fade down into mute was cut off at its start.
         for path, value in snapshot.data.items():
             if not self._path_in_scope(path, snapshot):
                 continue
@@ -1759,64 +1889,78 @@ class WingOSC(QObject):
                             fading_up   = target > current + 0.5
                             target_mute = int(mute_val)
                             if fading_down and target_mute == 1 and prev_mute == 0:
-                                delayed_cmds.append((int(fade_t * 950), mute_path, 1))
-                            elif fading_up and target_mute == 0 and prev_mute == 1:
+                                # Mute right at the end of the fade (95%),
+                                # driven by the fade timer on the main
+                                # thread -- so a new GO or Cancel fade
+                                # cancels / applies it, instead of a
+                                # sleeping thread muting the channel later.
                                 faded_paths.add(mute_path)
+                                self._pending_mutes.append(
+                                    (now + fade_t * 0.95, mute_path, 1))
+                            elif fading_up and target_mute == 0 and prev_mute == 1:
+                                # Unmute at once so the fade-in is heard.
+                                faded_paths.add(mute_path)
+                                with self._wing_state_lock:
+                                    self._wing_state[mute_path] = 0
+                                self._au_baseline[mute_path] = 0
                                 params.insert(0, (mute_path, '0', True))
-                continue
 
-            if path not in faded_paths:
-                if '/#' in path:
-                    # Hash-addressed parameter (model-ambiguous when
-                    # captured -- see print_node/wingmon.rs). `value` is
-                    # already the raw string exactly as Wing sent it, with
-                    # no int/float reinterpretation at any point. Send it
-                    # back completely unchanged -- wingmon's encode_param
-                    # recognises the embedded hash and addresses the
-                    # parameter directly, and the untouched string
-                    # preserves whichever type (int/float/string) Wing
-                    # itself originally chose for it.
-                    with self._wing_state_lock:
-                        self._wing_state[path] = value
-                    # Prime AU's baseline to this exact value too. Without
-                    # this, when Wing echoes back confirmation of the value
-                    # we just sent, AU compares it against whatever was
-                    # there BEFORE this recall (stale) and can mistake our
-                    # own recall for a fresh user change -- redundant at
-                    # best, and if the AU section mode is 'group'/'all' it
-                    # could re-propagate this value into OTHER cues that
-                    # were never touched. Same reasoning as the existing
-                    # fade-echo guard, just for instantly-recalled values.
-                    self._au_baseline[path] = value
-                    is_pri = scope_key in ('mute', 'fader')
-                    params.append((path, str(value), is_pri))
-                    continue
-                # `value` was already correctly typed (int vs float) at
-                # capture time by _parse_wing_val, which checks propmap's
-                # float_paths. Re-deriving that here was redundant and could
-                # even flip an already-correct float back to int -- just
-                # trust the stored type.
-                v = value
-                if isinstance(v, str):
-                    try:    v = int(v)
-                    except ValueError:
-                        try: v = float(v)
-                        except ValueError: pass
+        # Pass 2: everything that is recalled instantly.
+        for path, value in snapshot.data.items():
+            if path in faded_paths or not self._path_in_scope(path, snapshot):
+                continue
+            scope_key = self._path_to_scope_key(path)
+            if '/#' in path:
+                # Hash-addressed parameter (model-ambiguous when
+                # captured -- see print_node/wingmon.rs). `value` is
+                # already the raw string exactly as Wing sent it, with
+                # no int/float reinterpretation at any point. Send it
+                # back completely unchanged -- wingmon's encode_param
+                # recognises the embedded hash and addresses the
+                # parameter directly, and the untouched string
+                # preserves whichever type (int/float/string) Wing
+                # itself originally chose for it.
                 with self._wing_state_lock:
-                    self._wing_state[path] = v
-                # Same reasoning as the hash-addressed branch above -- prime
-                # AU's baseline so Wing's confirmation echo of our own
-                # recall isn't mistaken for a fresh user-driven change.
-                self._au_baseline[path] = v
-                if isinstance(v, float):
-                    vstr = f"{v:.6g}"
-                    # Ensure decimal so wingmon uses set_float not set_int
-                    if '.' not in vstr and 'e' not in vstr:
-                        vstr += '.0'
-                else:
-                    vstr = str(v)
+                    self._wing_state[path] = value
+                # Prime AU's baseline to this exact value too. Without
+                # this, when Wing echoes back confirmation of the value
+                # we just sent, AU compares it against whatever was
+                # there BEFORE this recall (stale) and can mistake our
+                # own recall for a fresh user change -- redundant at
+                # best, and if the AU section mode is 'group'/'all' it
+                # could re-propagate this value into OTHER cues that
+                # were never touched. Same reasoning as the existing
+                # fade-echo guard, just for instantly-recalled values.
+                self._au_baseline[path] = value
                 is_pri = scope_key in ('mute', 'fader')
-                params.append((path, vstr, is_pri))
+                params.append((path, str(value), is_pri))
+                continue
+            # `value` was already correctly typed (int vs float) at
+            # capture time by _parse_wing_val, which checks propmap's
+            # float_paths. Re-deriving that here was redundant and could
+            # even flip an already-correct float back to int -- just
+            # trust the stored type.
+            v = value
+            if isinstance(v, str):
+                try:    v = int(v)
+                except ValueError:
+                    try: v = float(v)
+                    except ValueError: pass
+            with self._wing_state_lock:
+                self._wing_state[path] = v
+            # Same reasoning as the hash-addressed branch above -- prime
+            # AU's baseline so Wing's confirmation echo of our own
+            # recall isn't mistaken for a fresh user-driven change.
+            self._au_baseline[path] = v
+            if isinstance(v, float):
+                vstr = f"{v:.6g}"
+                # Ensure decimal so wingmon uses set_float not set_int
+                if '.' not in vstr and 'e' not in vstr:
+                    vstr += '.0'
+            else:
+                vstr = str(v)
+            is_pri = scope_key in ('mute', 'fader')
+            params.append((path, vstr, is_pri))
 
         def _send_batches():
             proc = getattr(self, '_wingmon_proc', None)
@@ -1871,9 +2015,8 @@ class WingOSC(QObject):
             def send_batch(param_list, chunk_size=500, delay=0.002):
                 for i in range(0, len(param_list), chunk_size):
                     chunk = param_list[i:i+chunk_size]
-                    line = ','.join(f"{p}={v}" for p,v in chunk)
-                    proc.stdin.write(f"BATCH_SET {line}\n")
-                    proc.stdin.flush()
+                    line = BATCH_SEP.join(f"{p}={v}" for p,v in chunk)
+                    self._wingmon_stdin(f"BATCH_SET {line}")
                     if i + chunk_size < len(param_list):
                         time.sleep(delay)
 
@@ -1885,9 +2028,6 @@ class WingOSC(QObject):
                     time.sleep(MODEL_SWITCH_SETTLE_SECS)
                 send_batch(priority)
                 send_batch(secondary)
-                for ms, path, val in delayed_cmds:
-                    time.sleep(ms / 1000)
-                    self._wingmon_stdin(f"SET {path} {val}")
             except Exception:
                 import traceback, sys
                 traceback.print_exc(file=sys.stderr)
@@ -2085,13 +2225,23 @@ class WingOSC(QObject):
             if n + 1 >= steps:
                 done.append(job)
 
+        if self._pending_mutes:
+            import time as _t
+            now = _t.time()
+            due = [m for m in self._pending_mutes if m[0] <= now]
+            if due:
+                self._pending_mutes = [m for m in self._pending_mutes if m[0] > now]
+                for _, mpath, mval in due:
+                    batch.append((mpath, mval))
+                    self._au_baseline[mpath] = mval
+
         if batch:
             self._send_params_batch(batch)
 
         for job in done:
             self._fade_jobs.remove(job)
 
-        if not self._fade_jobs:
+        if not self._fade_jobs and not self._pending_mutes:
             self._unified_timer.stop()
             self._newest_fade_end_time = None
             self.fade_countdown.emit(None)
@@ -2130,13 +2280,14 @@ class WingOSC(QObject):
                 vstr = str(value)
             parts.append(f"{path}={vstr}")
         if parts:
-            self._wingmon_stdin(f"BATCH_SET {','.join(parts)}")
+            self._wingmon_stdin(f"BATCH_SET {BATCH_SEP.join(parts)}")
 
     def _cancel_all_fades(self):
         for job in self._fade_jobs:
             self._fading_paths.pop(job[0], None)
         self._unified_timer.stop()
         self._fade_jobs.clear()
+        self._pending_mutes = []
         self._newest_fade_end_time = None
         self.fade_countdown.emit(None)
 
@@ -2145,9 +2296,13 @@ class WingOSC(QObject):
         parameters straight to its final target value, instead of just
         stopping wherever the fade happened to be. Used by the 'Cancel
         fade' button next to GO."""
-        if not self._fade_jobs:
+        if not self._fade_jobs and not self._pending_mutes:
             return
         pairs = [(job[0], job[2]) for job in self._fade_jobs]   # (path, end_db)
+        # A fade down into mute ends muted -- apply its mute now as well.
+        for _, mpath, mval in self._pending_mutes:
+            pairs.append((mpath, mval))
+            self._au_baseline[mpath] = mval
         self._send_params_batch(pairs)
         self._cancel_all_fades()
 
@@ -3710,7 +3865,9 @@ class RecallScopeWidget(QWidget):
 
     def _refresh_group_col(self, child_item, col, sk):
         """After a channel-level scope toggle, recompute the parent group's
-        aggregate circle for that same column."""
+        aggregate circle for that same column. For the Sends column the
+        per-bus/matrix overrides count too, so a group whose channels only
+        recall some of their sends shows as partial."""
         parent = child_item.parent()
         if not parent:
             return
@@ -3718,11 +3875,24 @@ class RecallScopeWidget(QWidget):
         if not data:
             return
         global_val = self.snapshot.scope.get(sk, True)
-        # Read-only -- don't create channel scopes just for display
-        vals = [(self.snapshot.channel_scopes[ck].overrides.get(sk, global_val)
-                 if ck in self.snapshot.channel_scopes
-                 else global_val)
-                for ck in data.get("children", [])]
+        ch_keys = data.get("children", [])
+        if sk == 'sends':
+            vals = []
+            for ck in ch_keys:
+                if ck.startswith('dca_'):
+                    continue
+                cs_ck = self.snapshot.channel_scopes.get(ck)
+                fallback = cs_ck.overrides.get(sk, global_val) if cs_ck else global_val
+                if (ck.startswith('input_') or ck.startswith('bus_')) and cs_ck and cs_ck.send_overrides:
+                    vals.extend(cs_ck.send_overrides.get(d, fallback) for d in SEND_DEST_KEYS)
+                else:
+                    vals.append(fallback)
+        else:
+            # Read-only -- don't create channel scopes just for display
+            vals = [(self.snapshot.channel_scopes[ck].overrides.get(sk, global_val)
+                     if ck in self.snapshot.channel_scopes
+                     else global_val)
+                    for ck in ch_keys]
         if not vals:
             return
         if all(vals):   circle = CIRCLE_ON
@@ -3862,39 +4032,6 @@ class RecallScopeWidget(QWidget):
         elif any(vals): circle = CIRCLE_PART
         else:           circle = CIRCLE_OFF
         item.setData(SENDS_COL, CIRCLE_ROLE, circle)
-
-
-        parent = child_item.parent()
-        if not parent:
-            return
-        data = parent.data(LABEL_COL, Qt.ItemDataRole.UserRole)
-        if not data:
-            return
-        global_val = self.snapshot.scope.get(sk, True)
-        ch_keys = data.get("children", [])
-        if sk == 'sends':
-            vals = []
-            for ck in ch_keys:
-                if ck.startswith('dca_'):
-                    continue
-                cs_ck = self.snapshot.channel_scopes.get(ck)
-                fallback = cs_ck.overrides.get(sk, global_val) if cs_ck else global_val
-                if (ck.startswith('input_') or ck.startswith('bus_')) and cs_ck and cs_ck.send_overrides:
-                    vals.extend(cs_ck.send_overrides.get(d, fallback) for d in SEND_DEST_KEYS)
-                else:
-                    vals.append(fallback)
-        else:
-            # Read-only -- don't create channel scopes just for display
-            vals = [(self.snapshot.channel_scopes[ck].overrides.get(sk, global_val)
-                     if ck in self.snapshot.channel_scopes
-                     else global_val)
-                    for ck in ch_keys]
-        if not vals:
-            return
-        if all(vals):   circle = CIRCLE_ON
-        elif any(vals): circle = CIRCLE_PART
-        else:           circle = CIRCLE_OFF
-        parent.setData(col, CIRCLE_ROLE, circle)
 
     # ── Header column click -- toggle entire column ────────────────────────────
 
@@ -4118,11 +4255,19 @@ class ConnectionPanel(QWidget):
         self.conn_btn = QPushButton("Connect")
         self.conn_btn.setObjectName("green_btn"); self.conn_btn.setMinimumWidth(80)
         self.conn_btn.clicked.connect(self._on_connect); l.addWidget(self.conn_btn)
+
+        self.reconnect_cb = QCheckBox("Auto-reconnect")
+        self.reconnect_cb.setChecked(True)
+        self.reconnect_cb.setToolTip(
+            "If the connection to the Wing is lost (not when you press Disconnect),\n"
+            "try to connect again every 5 seconds until it is back.")
+        l.addWidget(self.reconnect_cb)
         l.addStretch()
 
         # Widgets to hide in live mode
         self._edit_widgets = [self.ip_lbl, self.ip_input,
-                              self.iface_lbl, self.iface_combo, self.conn_btn]
+                              self.iface_lbl, self.iface_combo, self.conn_btn,
+                              self.reconnect_cb]
 
     def set_live(self, live):
         """Show/hide edit-only widgets based on mode."""
@@ -4204,6 +4349,18 @@ class ConnectionPanel(QWidget):
             self.status.setText("Not connected")
             self.status.setStyleSheet(f"color:{C['text2']};font-size:12px;")
             self.conn_btn.setText("Connect"); self.conn_btn.setObjectName("green_btn")
+        self.conn_btn.setStyle(self.conn_btn.style())
+
+    def set_reconnecting(self, attempt):
+        """Show that the app is trying to get the connection back. The
+        button becomes 'Stop' (= Disconnect, which ends the attempts)."""
+        self.dot.setStyleSheet(f"color:{C['amber']};font-size:16px;")
+        txt = "Connection lost -- reconnecting…"
+        if attempt:
+            txt = f"Connection lost -- reconnecting (attempt {attempt})…"
+        self.status.setText(txt)
+        self.status.setStyleSheet(f"color:{C['amber']};font-size:12px;")
+        self.conn_btn.setText("Stop"); self.conn_btn.setObjectName("danger_btn")
         self.conn_btn.setStyle(self.conn_btn.style())
 
 
@@ -5253,7 +5410,8 @@ class OscSettingsPanel(QWidget):
             "  /wingtheatre/snap/go  <number or name>   -- recall specific snapshot\n"
             "  /wingtheatre/store                       -- Store from Wing\n"
             "  /wingtheatre/autoupdate/on  |  /off       -- toggle Auto Update\n"
-            "  /wingtheatre/addsnap  [name]              -- add new snapshot (optional name)")
+            "  /wingtheatre/addsnap  [name]              -- add new snapshot (optional name)\n"
+            "  /wingtheatre/cancelfade                   -- Cancel fade: all fades jump to target")
         cmds.setStyleSheet(
             f"color:{C['text3']};font-size:11px;font-family:'Courier New',monospace;"
             f"background:{C['bg']};border:1px solid {C['border']};"
@@ -5293,6 +5451,7 @@ class OscSettingsPanel(QWidget):
             "Commands (TCP, newline-delimited):\n"
             "  GO / NEXT_GO / PREV_GO  /  SNAP_GO <n|name>\n"
             "  AU_ON / AU_OFF / AU_TOGGLE  /  ADD_SNAP [name]  /  GET_STATE\n"
+            "  CANCEL_FADE\n"
             "Feedback sent on change:\n"
             "  STATE current_cue_num=001  /  current_cue_name=Scene 1\n"
             "  STATE next_cue_num=002  /  autoupdate=true  /  wing_connected=true\n"
@@ -5511,6 +5670,7 @@ class OscServer(QObject):
     store_triggered = pyqtSignal()
     autoupdate_set  = pyqtSignal(bool)
     addsnap         = pyqtSignal(str)   # /wingtheatre/addsnap [name]
+    cancel_fade     = pyqtSignal()      # /wingtheatre/cancelfade
     status_changed  = pyqtSignal(bool, int)
     log             = pyqtSignal(str)
 
@@ -5539,6 +5699,7 @@ class OscServer(QObject):
             d.map("/wingtheatre/autoupdate/on",  self._h_au_on)
             d.map("/wingtheatre/autoupdate/off", self._h_au_off)
             d.map("/wingtheatre/addsnap",        self._h_addsnap)
+            d.map("/wingtheatre/cancelfade",     self._h_cancel_fade)
 
             self._server = ThreadingOSCUDPServer(("0.0.0.0", port), d)
             self._thread = threading.Thread(
@@ -5592,6 +5753,9 @@ class OscServer(QObject):
     def _h_au_off(self, address, *args):
         self.autoupdate_set.emit(False)
 
+    def _h_cancel_fade(self, address, *args):
+        self.cancel_fade.emit()
+
     def _h_addsnap(self, address, *args):
         """Add a new snapshot. Optional string arg = name."""
         name = str(args[0]) if args and args[0] else ""
@@ -5611,7 +5775,7 @@ def _get_version():
         if base:
             p = os.path.join(base, 'version.txt')
             if os.path.exists(p):
-                try: return open(p, encoding='utf-8').read().strip()
+                try: return open(p, encoding='utf-8-sig').read().strip()
                 except: pass
     return "dev"
 
@@ -5620,7 +5784,7 @@ class AboutDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("About Wing Theatre Controller")
-        self.setFixedSize(420, 320)
+        self.setFixedSize(440, 340)
         self.setStyleSheet(f"background:{C['bg2']};color:{C['text']};")
 
         layout = QVBoxLayout(self)
@@ -5676,12 +5840,17 @@ class AboutDialog(QDialog):
 
         layout.addStretch()
 
-        # Close button
+        # Buttons: open the log folder (for sending logs when reporting a
+        # problem) and Close
+        logs_btn = QPushButton("Open log folder")
+        logs_btn.setToolTip(log_folder())
+        logs_btn.clicked.connect(lambda: open_in_file_manager(log_folder()))
         btn = QPushButton("Close")
         btn.setFixedWidth(100)
         btn.clicked.connect(self.accept)
         btn_row = QHBoxLayout()
         btn_row.addStretch()
+        btn_row.addWidget(logs_btn)
         btn_row.addWidget(btn)
         btn_row.addStretch()
         layout.addLayout(btn_row)
@@ -5697,16 +5866,26 @@ class MainWindow(QMainWindow):
         self._dirty = False
         self._autosave_timer = QTimer()
         self._autosave_timer.timeout.connect(self._autosave)
+        # Auto-reconnect: only after an UNEXPECTED loss of the connection
+        # (never after the user pressed Disconnect), and only when the
+        # Auto-reconnect box is ticked.
+        self._user_disconnected = True
+        self._last_conn = None            # (ip, port, local_ip) of the last Connect
+        self._reconnect_attempt = 0
+        self._reconnect_started = 0.0
+        self._reconnect_timer = QTimer(self)
+        self._reconnect_timer.setInterval(5000)
+        self._reconnect_timer.timeout.connect(self._try_reconnect)
         # Persistent diagnostic log -- every status-bar message (connection
         # events, sync progress, propmap misses, model changes etc.) also
         # gets written here with a timestamp, so it can be captured and sent
         # for debugging without needing to watch the status bar live.
-        base = os.path.dirname(os.path.abspath(
-            sys.executable if getattr(sys, 'frozen', False) else __file__))
-        self._log_file_path = os.path.join(base, 'wing_theatre_log.txt')
+        self._log_file_path = os.path.join(log_folder(), 'wing_theatre_log.txt')
+        _rotate_log(self._log_file_path)
         try:
             with open(self._log_file_path, 'a', encoding='utf-8') as f:
-                f.write(f"\n=== Session started {datetime.datetime.now().isoformat()} ===\n")
+                f.write(f"\n=== Session started {datetime.datetime.now().isoformat()} "
+                        f"-- version {_get_version()} on {sys.platform} ===\n")
         except Exception:
             pass
         self._setup_ui(); self._connect_signals(); self._new_show()
@@ -5715,9 +5894,9 @@ class MainWindow(QMainWindow):
         self.osc_settings_panel.set_osc_server(self.osc_server)
 
     def _log_to_file(self, msg):
-        """Append a timestamped line to wing_theatre_log.txt next to the
-        app. Same file location/pattern as crash_log.txt, so both are easy
-        to find together. Silently does nothing if the file can't be
+        """Append a timestamped line to wing_theatre_log.txt in log_folder()
+        -- the same folder as crash_log.txt, so both are easy to find
+        together (About -> Open log folder). Silently does nothing if the file can't be
         written (e.g. read-only install location) -- this must never be
         the reason something else breaks."""
         try:
@@ -5778,6 +5957,15 @@ class MainWindow(QMainWindow):
         self._autosave_spin.valueChanged.connect(
             lambda: self._autosave_spin.lineEdit().deselect())
         tb.addWidget(self._autosave_spin)
+        tb.addWidget(QLabel("  "))
+        self._backup_cb = QCheckBox("Backups")
+        self._backup_cb.setChecked(True)
+        self._backup_cb.setToolTip(
+            "On every save (also autosave) keep a copy of the previous version in\n"
+            "the folder '<show name> backups' next to the show file.\n"
+            f"The newest {ShowFile.BACKUP_KEEP} are kept; identical versions are skipped.")
+        self._backup_cb.toggled.connect(lambda _: self._mark_dirty())
+        tb.addWidget(self._backup_cb)
         self.conn_panel = ConnectionPanel()
         self.conn_panel.setStyleSheet(f"border-bottom:1px solid {C['border']};")
         self.conn_panel.setFixedHeight(44)
@@ -5820,9 +6008,9 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+A"), self, self._add_snapshot)
 
     def _connect_signals(self):
-        self.conn_panel.connect_requested.connect(
-            lambda ip, p, lip: self.osc.connect(ip, p, lip))
-        self.conn_panel.disconnect_requested.connect(self.osc.disconnect)
+        self.conn_panel.connect_requested.connect(self._user_connect)
+        self.conn_panel.disconnect_requested.connect(self._user_disconnect)
+        self.conn_panel.reconnect_cb.toggled.connect(self._on_reconnect_toggled)
         self.osc.connected.connect(lambda c: self.conn_panel.set_connected(c, self.osc.ip))
         self.osc.connected.connect(self._on_connected)
         self.osc.sync_complete.connect(self._on_sync_complete)
@@ -5885,6 +6073,7 @@ class MainWindow(QMainWindow):
         self.osc_server.store_triggered.connect(self._capture)
         self.osc_server.autoupdate_set.connect(self._osc_autoupdate)
         self.osc_server.addsnap.connect(self._osc_addsnap)
+        self.osc_server.cancel_fade.connect(self.osc.jump_fades_to_target)
         self.osc_server.log.connect(lambda m: self.status_bar.showMessage(m, 4000))
 
     # ── Dirty tracking & close ───────────────────────────────────────────────
@@ -5898,6 +6087,14 @@ class MainWindow(QMainWindow):
             btn.setText("Cancel fade")
         else:
             btn.setText(f"Cancel fade ({int(remaining) + 1}s)")
+        # Companion feedback: 'fading' used to be sent only with the full
+        # state (on connect), so a Companion button never saw a fade start
+        # or end. Send it on every change, plus the seconds left.
+        fading = remaining is not None
+        if fading != getattr(self, '_tcp_fading', None):
+            self._tcp_fading = fading
+            self.tcp_server.send_state("fading", str(fading).lower())
+        self.tcp_server.send_state("fade_remaining", f"{int(remaining) + 1}" if fading else "")
 
     def _mark_dirty(self):
         self._dirty = True
@@ -5961,10 +6158,12 @@ class MainWindow(QMainWindow):
                 return
             try:
                 self._collect_app_settings()
-                self.show_file.save(self.show_file.filepath)
+                warn = self.show_file.save(self.show_file.filepath,
+                                           backup=self._backup_cb.isChecked())
                 self._mark_clean()
                 self.status_bar.showMessage(
-                    f"Autosaved -- {self.show_file.filepath}", 4000)
+                    f"Autosaved -- {self.show_file.filepath}"
+                    + (f"  (⚠ {warn})" if warn else ""), 6000 if warn else 4000)
             except Exception as e:
                 self.status_bar.showMessage(f"Autosave failed: {e}", 6000)
 
@@ -6014,6 +6213,8 @@ class MainWindow(QMainWindow):
                 "tcp_remote_port":    osp.tcp_port.value(),
                 "tcp_remote_enabled": bool(self.tcp_server._running),
                 "autosave_minutes":   self._autosave_spin.value(),
+                "backup_on_save":     self._backup_cb.isChecked(),
+                "auto_reconnect":     self.conn_panel.reconnect_cb.isChecked(),
                 "default_scope":        dict(DEFAULT_SCOPE),
                 "default_channel_scopes": {k: v.to_dict() for k, v in DEFAULT_CHANNEL_SCOPES.items()},
                 "default_fx_scope":      dict(DEFAULT_FX_SCOPE),
@@ -6082,6 +6283,15 @@ class MainWindow(QMainWindow):
 
             if "autosave_minutes" in s:
                 self._autosave_spin.setValue(int(s["autosave_minutes"]))
+            if "backup_on_save" in s:
+                self._backup_cb.blockSignals(True)
+                self._backup_cb.setChecked(bool(s["backup_on_save"]))
+                self._backup_cb.blockSignals(False)
+            if "auto_reconnect" in s:
+                cb = self.conn_panel.reconnect_cb
+                cb.blockSignals(True)
+                cb.setChecked(bool(s["auto_reconnect"]))
+                cb.blockSignals(False)
 
             if s.get("window_geometry") and not self.conn_panel.live_btn.isChecked():
                 self._restore_window_geometry(s["window_geometry"])
@@ -6129,18 +6339,28 @@ class MainWindow(QMainWindow):
         path,_ = QFileDialog.getOpenFileName(self,"Open Show","",
             "Wing Theatre Show (*.wts);;All Files (*)")
         if path:
-            try:
-                self.show_file = ShowFile.load(path); self._reload()
-                self._mark_clean()
-                self.setWindowTitle(f"Wing Theatre Controller -- {self.show_file.name}")
-                self.status_bar.showMessage(f"Opened: {path}")
-            except Exception as e: QMessageBox.critical(self,"Error",f"Could not open:\n{e}")
+            self.open_show_path(path)
+
+    def open_show_path(self, path):
+        """Open a show file by path -- from the Open dialog, from the
+        command line, or by double-clicking a .wts file (Windows installer
+        file association / macOS Finder)."""
+        try:
+            self.show_file = ShowFile.load(path); self._reload()
+            self._mark_clean()
+            self.setWindowTitle(f"Wing Theatre Controller -- {self.show_file.name}")
+            self.status_bar.showMessage(f"Opened: {path}")
+            return True
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Could not open:\n{path}\n\n{e}")
+            return False
 
     def _save_show(self):
         self._collect_app_settings()
         if self.show_file.filepath:
             try:
-                self.show_file.save(self.show_file.filepath)
+                warn = self.show_file.save(self.show_file.filepath,
+                                           backup=self._backup_cb.isChecked())
             except Exception as e:
                 QMessageBox.critical(self, "Save failed",
                     f"Could not save:\n{self.show_file.filepath}\n\n{e}\n\n"
@@ -6148,7 +6368,8 @@ class MainWindow(QMainWindow):
                 return
             self._mark_clean()
             self.setWindowTitle(f"Wing Theatre Controller -- {self.show_file.name}")
-            self.status_bar.showMessage(f"Saved: {self.show_file.filepath}")
+            self.status_bar.showMessage(f"Saved: {self.show_file.filepath}"
+                                        + (f"  (⚠ {warn})" if warn else ""))
         else: self._save_show_as()
 
     def _save_show_as(self):
@@ -6160,13 +6381,14 @@ class MainWindow(QMainWindow):
             import os
             self.show_file.name = os.path.splitext(os.path.basename(path))[0]
             try:
-                self.show_file.save(path)
+                warn = self.show_file.save(path, backup=self._backup_cb.isChecked())
             except Exception as e:
                 QMessageBox.critical(self, "Save failed", f"Could not save:\n{path}\n\n{e}")
                 return
             self._mark_clean()
             self.setWindowTitle(f"Wing Theatre Controller -- {self.show_file.name}")
-            self.status_bar.showMessage(f"Saved as: {path}")
+            self.status_bar.showMessage(f"Saved as: {path}"
+                                        + (f"  (⚠ {warn})" if warn else ""))
 
     def _add_snapshot(self):
         if not self._wing_ready("Add Snap"):
@@ -6483,14 +6705,9 @@ class MainWindow(QMainWindow):
         elif verb == "PREV_GO":
             self._osc_prev_go()
         elif verb == "SNAP_GO":
-            try:
-                self._osc_snap_go(int(arg))
-            except ValueError:
-                for i, s in enumerate(self.show_file.snapshots):
-                    if s.name.lower() == arg.lower():
-                        self.cue_panel.set_current(i)
-                        self._go()
-                        break
+            # Same lookup as OSC: cue number, exact name, or an unambiguous
+            # part of a name.
+            self._osc_snap_go(arg)
         elif verb == "AU_ON":
             self._osc_autoupdate(True)
         elif verb == "AU_OFF":
@@ -6505,6 +6722,8 @@ class MainWindow(QMainWindow):
         elif verb == "PREV":
             self.cue_panel.go_prev()
             self._tcp_send_cue_state()
+        elif verb == "CANCEL_FADE":
+            self.osc.jump_fades_to_target()
         elif verb == "GET_STATE":
             self._tcp_send_full_state()
 
@@ -6550,10 +6769,17 @@ class MainWindow(QMainWindow):
             name_lower = str(value).strip().lower()
             target = next(
                 (s for s in snaps if s.name.strip().lower() == name_lower), None)
-        # 3) Try partial name match
-        if target is None:
-            target = next(
-                (s for s in snaps if name_lower in s.name.strip().lower()), None)
+        # 3) Partial name match -- only if it is unambiguous. A remote typo
+        #    matching several cues used to fire whichever came first.
+        if target is None and name_lower:
+            hits = [s for s in snaps if name_lower in s.name.strip().lower()]
+            if len(hits) == 1:
+                target = hits[0]
+            elif len(hits) > 1:
+                self.status_bar.showMessage(
+                    f"OSC: '{value}' matches {len(hits)} cues -- use the cue number "
+                    f"or the full name. Nothing fired.", 6000)
+                return
 
         if target:
             idx = snaps.index(target)
@@ -6706,6 +6932,71 @@ class MainWindow(QMainWindow):
             if hasattr(self, '_sync_timeout'):
                 self._sync_timeout.stop()
             self.status_bar.showMessage("Disconnected", 3000)
+        self._update_reconnect(connected)
+
+    # ── Auto-reconnect ───────────────────────────────────────────────────────
+
+    def _user_connect(self, ip, port, local_ip):
+        self._last_conn = (ip, port, local_ip)
+        self._user_disconnected = False
+        self._reconnect_timer.stop()
+        self._reconnect_attempt = 0
+        self.osc.connect(ip, port, local_ip)
+
+    def _user_disconnect(self):
+        self._user_disconnected = True
+        was_reconnecting = self._reconnect_timer.isActive()
+        self._reconnect_timer.stop()
+        self._reconnect_attempt = 0
+        self.osc.disconnect()
+        if was_reconnecting:
+            self.status_bar.showMessage("Auto-reconnect stopped", 4000)
+
+    def _on_reconnect_toggled(self, on):
+        self._mark_dirty()
+        if not on and self._reconnect_timer.isActive():
+            self._reconnect_timer.stop()
+            self.osc._stop_wingmon()
+            self.conn_panel.set_connected(False)
+            self.status_bar.showMessage("Auto-reconnect switched off", 4000)
+
+    def _update_reconnect(self, connected):
+        if connected:
+            if self._reconnect_timer.isActive() or self._reconnect_attempt:
+                self._log_to_file(f"Reconnected after {self._reconnect_attempt} attempt(s)")
+            self._reconnect_timer.stop()
+            self._reconnect_attempt = 0
+            return
+        if (self._user_disconnected or not self._last_conn
+                or not self.conn_panel.reconnect_cb.isChecked()
+                or self._reconnect_timer.isActive()):
+            return
+        self._reconnect_attempt = 0
+        self.conn_panel.set_reconnecting(0)
+        self.status_bar.showMessage(
+            "⚠ Connection to the Wing lost -- trying to reconnect every 5 s "
+            "(GO is locked until it is back and synced)")
+        self._reconnect_timer.start()
+
+    def _try_reconnect(self):
+        import time as _t
+        if self.osc.is_connected or self._user_disconnected or not self._last_conn:
+            self._reconnect_timer.stop()
+            return
+        if not self.conn_panel.reconnect_cb.isChecked():
+            self._reconnect_timer.stop()
+            return
+        # An attempt is still under way (wingmon running, waiting for the
+        # Wing to answer) -- give it up to 20 s before starting over.
+        if self.osc._wingmon_running_ok() and _t.time() - self._reconnect_started < 20:
+            return
+        self._reconnect_attempt += 1
+        self._reconnect_started = _t.time()
+        self.conn_panel.set_reconnecting(self._reconnect_attempt)
+        ip, port, local_ip = self._last_conn
+        self.status_bar.showMessage(
+            f"⟳ Reconnecting to the Wing at {ip} (attempt {self._reconnect_attempt})…")
+        self.osc.connect(ip, port, local_ip)
 
     def _on_sync_complete(self, param_count: int):
         """Wing state fully synced -- enable all UI."""
@@ -6954,19 +7245,294 @@ class MainWindow(QMainWindow):
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
+# ─── Self-test ───────────────────────────────────────────────────────────────
+
+def run_selftest(out_dir):
+    """Smoke test run by GitHub Actions on the BUILT app (Windows .exe,
+    macOS .app and the installed Windows version), so a broken build
+    (missing library, missing wingmon/propmap, a crash in startup or in
+    core show logic) fails the build instead of reaching a show:
+
+        "Wing Theatre Controller" --selftest <folder>
+
+    Needs no Wing: a stand-in for wingmon records what would be sent.
+    Writes <folder>/selftest.txt with one PASS/FAIL line per check and
+    returns the exit code (0 = all passed)."""
+    import io, time, tempfile, traceback, socket as _socket
+    os.makedirs(out_dir, exist_ok=True)
+    lines, failures = [], []
+
+    def check(name, fn):
+        try:
+            res = fn()
+            lines.append(f"PASS {name}" + (f" -- {res}" if res else ""))
+        except Exception as e:
+            failures.append(name)
+            lines.append(f"FAIL {name} -- {type(e).__name__}: {e}")
+            lines.append("     " + traceback.format_exc().replace("\n", "\n     "))
+
+    def wait(ms):
+        end = time.time() + ms / 1000
+        while time.time() < end:
+            QApplication.processEvents()
+            time.sleep(0.01)
+
+    class _FakeProc:
+        """Stands in for the wingmon process: records every stdin line."""
+        def __init__(self):
+            self.stdin = io.StringIO()
+        def poll(self):
+            return None
+        def sent(self):
+            return [l for l in self.stdin.getvalue().splitlines() if l]
+
+    lines.append(f"Wing Theatre Controller {_get_version()} self-test, "
+                 f"{sys.platform}, Python {sys.version.split()[0]}, frozen={getattr(sys, 'frozen', False)}")
+    w = None
+
+    def t_bundle():
+        if not getattr(sys, 'frozen', False):
+            return "not a built app -- bundle check skipped"
+        for p in (WingOSC.WINGMON_PATH, WingOSC.PROPMAP_PATH):
+            if not os.path.isfile(p):
+                raise AssertionError(f"missing in the app: {p}")
+        if sys.platform != 'win32' and not os.access(WingOSC.WINGMON_PATH, os.X_OK):
+            raise AssertionError("wingmon is not executable")
+        return f"wingmon + propmap present ({os.path.basename(WingOSC.WINGMON_PATH)})"
+    check("bundle contains wingmon and propmap", t_bundle)
+
+    def t_window():
+        nonlocal w
+        w = MainWindow(); w.show(); wait(200)
+        return f"log: {w._log_file_path}"
+    check("main window starts", t_window)
+    if w is None:
+        _write_selftest(out_dir, lines, failures)
+        return 1
+
+    def make_show():
+        sf = w.show_file
+        for n, (fdr, mute) in enumerate([(-10.0, 0), (-60.0, 1)], start=1):
+            sn = Snapshot(f"Test {n}", n)
+            sn.data = {"/ch/1/fdr": fdr, "/ch/1/mute": mute, "/ch/1/name": "BD",
+                       "/ch/1/eq/#a1b2c3d4": "1.5", "/ch/1/send/1/lvl": -5.0,
+                       "/ch/1/send/MX1/lvl": -7.0, "/ch/2/fdr": -20.0}
+            sf.snapshots.append(sn)
+        w._refresh_cue_list()
+        return f"{len(sf.snapshots)} cues"
+    check("build a show", make_show)
+
+    def t_scope_clicks():
+        snap = w.show_file.snapshots[0]
+        w.cue_panel.set_current(0); w._on_cue_selected(0); wait(100)
+        sw = w.detail_panel.scope_widget
+        sw._toggle_sends_expanded(); wait(50)
+        grp = sw.tree.topLevelItem(0)          # All Input Channels
+        w._dirty = False
+        sw._on_item_clicked(grp, SEND_FIRST_COL)            # Bus 1 for all inputs
+        ch1 = grp.child(0)
+        sw._on_item_clicked(ch1, SEND_FIRST_COL + 1)        # Bus 2 on Input 1
+        sw._on_item_clicked(ch1, SENDS_COL)                 # all sends Input 1
+        sw._on_item_clicked(ch1, FIRST_SCOPE)               # a normal column
+        wait(50)
+        if not w._dirty:
+            raise AssertionError("scope clicks did not mark the show as changed")
+        if "1" not in snap.get_ch_scope("input_01").send_overrides:
+            raise AssertionError("per-bus send override not stored")
+        sw._toggle_sends_expanded()
+        return "sends columns, group + channel clicks"
+    check("recall scope clicks", t_scope_clicks)
+
+    def t_save_load():
+        w._collect_app_settings()
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "selftest.wts")
+        w.show_file.save(p)
+        back = ShowFile.load(p)
+        a = json.loads(json.dumps(w.show_file.to_dict()))
+        b = json.loads(json.dumps(back.to_dict()))
+        a.pop("name", None); b.pop("name", None)
+        if a != b:
+            raise AssertionError("show file changed after save + load")
+        w.open_show_path(p); wait(100)
+        return f"{os.path.getsize(p)} bytes"
+    check("save and reopen show", t_save_load)
+
+    osc = w.osc
+
+    def recall(snap, state):
+        fake = _FakeProc()
+        osc._wingmon_proc = fake
+        with osc._wing_state_lock:
+            osc._wing_state.clear(); osc._wing_state.update(state)
+        osc.recall_snapshot(snap)
+        for t in threading.enumerate():
+            if t.name == "RecallBatch":
+                t.join(5)
+        return fake
+
+    def t_recall_instant():
+        snap = w.show_file.snapshots[0]
+        snap.group_fades = {}
+        fake = recall(snap, {"/ch/1/fdr": -30.0, "/ch/1/mute": 1})
+        sent = " ".join(fake.sent())
+        for must in ("/ch/1/fdr=-10.0", "/ch/1/mute=0", "/ch/1/eq/#a1b2c3d4=1.5"):
+            if must not in sent:
+                raise AssertionError(f"'{must}' was not sent: {sent[:300]}")
+        return f"{len(fake.sent())} line(s)"
+    check("recall without fades", t_recall_instant)
+
+    def t_fade_up_from_mute():
+        snap = w.show_file.snapshots[0]
+        snap.set_group_fade("inputs", "fader", 0.3)
+        fake = recall(snap, {"/ch/1/fdr": -60.0, "/ch/1/mute": 1})
+        first = fake.sent()[0] if fake.sent() else ""
+        if "/ch/1/mute=0" not in first:
+            raise AssertionError(f"unmute not sent first: {first[:200]}")
+        if "/ch/1/eq/#a1b2c3d4=1.5" not in " ".join(fake.sent()):
+            raise AssertionError("instant parameters missing next to a fade")
+        wait(600)
+        last = fake.sent()[-1]
+        if "/ch/1/fdr=-10.0" not in last:
+            raise AssertionError(f"fade did not end on target: {last[:200]}")
+        snap.set_group_fade("inputs", "fader", 0.0)
+        return f"{len(fake.sent())} lines, ends at -10 dB"
+    check("fade up out of mute", t_fade_up_from_mute)
+
+    def t_fade_down_into_mute():
+        snap = w.show_file.snapshots[1]
+        snap.set_group_fade("inputs", "fader", 0.4)
+        fake = recall(snap, {"/ch/1/fdr": -10.0, "/ch/1/mute": 0})
+        early = " ".join(fake.sent())
+        if "/ch/1/mute=1" in early:
+            raise AssertionError("mute sent at the start of the fade")
+        wait(700)
+        if "/ch/1/mute=1" not in " ".join(fake.sent()):
+            raise AssertionError("mute never sent at the end of the fade")
+        # A new GO during the fade must cancel the pending mute
+        fake = recall(snap, {"/ch/1/fdr": -10.0, "/ch/1/mute": 0})
+        osc._cancel_all_fades()
+        wait(600)
+        if "/ch/1/mute=1" in " ".join(fake.sent()):
+            raise AssertionError("cancelled fade still muted the channel later")
+        # Cancel fade (jump to target) applies the mute at once
+        fake = recall(snap, {"/ch/1/fdr": -10.0, "/ch/1/mute": 0})
+        osc.jump_fades_to_target()
+        if "/ch/1/mute=1" not in " ".join(fake.sent()):
+            raise AssertionError("Cancel fade did not apply the end-of-fade mute")
+        snap.set_group_fade("inputs", "fader", 0.0)
+        return "mute at the end, cancelled by new GO, applied by Cancel fade"
+    check("fade down into mute", t_fade_down_into_mute)
+    osc._cancel_all_fades()
+    osc._wingmon_proc = None
+
+    def t_tcp():
+        srv = RemoteTCPServer()
+        srv.start(0)
+        for _ in range(100):
+            if srv._server: break
+            time.sleep(0.02)
+        port = srv._server.getsockname()[1]
+        cs = []
+        for _ in range(RemoteTCPServer.MAX_CLIENTS + 1):
+            c = _socket.create_connection(("127.0.0.1", port), timeout=2)
+            cs.append(c); time.sleep(0.1)
+        wait(100)
+        if len(srv.client_addrs) != RemoteTCPServer.MAX_CLIENTS:
+            raise AssertionError(f"{len(srv.client_addrs)} clients, expected {RemoteTCPServer.MAX_CLIENTS}")
+        if b"server full" not in cs[-1].recv(100):
+            raise AssertionError("5th client not refused")
+        srv.send_state("selftest", "1")
+        for c in cs[:-1]:
+            if b"STATE selftest=1" not in c.recv(100):
+                raise AssertionError("state not sent to every client")
+        for c in cs:
+            c.close()
+        srv.stop()
+        return f"{RemoteTCPServer.MAX_CLIENTS} clients + refusal"
+    check("Companion TCP server", t_tcp)
+
+    def t_backups():
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "backuptest.wts")
+        sf = w.show_file
+        sf.save(p, backup=True)                      # first save: nothing to back up
+        bdir = ShowFile.backup_folder(p)
+        n0 = len(os.listdir(bdir)) if os.path.isdir(bdir) else 0
+        sf.snapshots[0].notes = "changed"; sf.save(p, backup=True)
+        time.sleep(1.1)
+        sf.save(p, backup=True)                      # backs up the changed version
+        n1 = len(os.listdir(bdir))
+        sf.save(p, backup=False)
+        n2 = len(os.listdir(bdir))
+        if n0 != 0 or n1 < 1 or n2 != n1:
+            raise AssertionError(f"backups: {n0} -> {n1} -> {n2}")
+        return f"{n1} backup(s) in '{os.path.basename(bdir)}'"
+    check("show backups", t_backups)
+
+    def t_reconnect_logic():
+        cb = w.conn_panel.reconnect_cb
+        w._last_conn = ("192.0.2.1", 2223, "0.0.0.0")
+        w._user_disconnected = False
+        cb.setChecked(True)
+        w._update_reconnect(False)                   # unexpected loss
+        if not w._reconnect_timer.isActive():
+            raise AssertionError("did not start reconnecting after a lost connection")
+        w._user_disconnect()                         # user presses Stop/Disconnect
+        if w._reconnect_timer.isActive():
+            raise AssertionError("Disconnect did not stop reconnecting")
+        w._user_disconnected = False
+        cb.setChecked(False)
+        w._update_reconnect(False)
+        if w._reconnect_timer.isActive():
+            raise AssertionError("reconnected although Auto-reconnect is off")
+        cb.setChecked(True)
+        w._user_disconnected = True
+        return "starts on loss, stops on Disconnect, respects the switch"
+    check("auto-reconnect logic", t_reconnect_logic)
+
+    def t_log():
+        w._log_to_file("selftest")
+        if not os.path.isfile(w._log_file_path):
+            raise AssertionError(f"log not written: {w._log_file_path}")
+        return log_folder()
+    check("log file", t_log)
+
+    try:
+        w._dirty = False
+        w.close()
+    except Exception:
+        pass
+    _write_selftest(out_dir, lines, failures)
+    return 1 if failures else 0
+
+
+def _write_selftest(out_dir, lines, failures):
+    lines.append(f"RESULT {'FAIL' if failures else 'PASS'} -- "
+                 f"{len(failures)} failed: {', '.join(failures) or 'none'}")
+    text = "\n".join(lines) + "\n"
+    try:
+        with open(os.path.join(out_dir, "selftest.txt"), "w", encoding="utf-8") as f:
+            f.write(text)
+    except Exception:
+        pass
+    try:
+        print(text)
+    except Exception:
+        pass
+
+
 def main():
     import traceback, datetime
 
     def _log_crash(exc_type, exc_value, exc_tb):
         """Catch-all safety net: on Windows especially, an unhandled exception
         in a Qt slot can otherwise kill the whole app with no visible error.
-        Write full details to crash_log.txt next to the app so it can be
+        Write full details to crash_log.txt in log_folder() so it can be
         sent back for diagnosis, and still print to stderr if a console
         happens to be attached."""
         try:
-            base = os.path.dirname(os.path.abspath(
-                sys.executable if getattr(sys, 'frozen', False) else __file__))
-            log_path = os.path.join(base, 'crash_log.txt')
+            log_path = os.path.join(log_folder(), 'crash_log.txt')
             with open(log_path, 'a', encoding='utf-8') as f:
                 f.write(f"\n--- {datetime.datetime.now().isoformat()} ---\n")
                 traceback.print_exception(exc_type, exc_value, exc_tb, file=f)
@@ -6978,8 +7544,27 @@ def main():
             pass
 
     sys.excepthook = _log_crash
+    # Exceptions in background threads (wingmon reader, recall sender, TCP
+    # clients) don't go through sys.excepthook -- log those too.
+    def _log_thread_crash(args):
+        if args.exc_type is SystemExit:
+            return
+        _log_crash(args.exc_type, args.exc_value, args.exc_traceback)
+    threading.excepthook = _log_thread_crash
 
-    app = QApplication(sys.argv); app.setStyle("Fusion")
+    argv = list(sys.argv)
+    selftest_dir = None
+    if "--selftest" in argv:
+        i = argv.index("--selftest")
+        selftest_dir = argv[i + 1] if i + 1 < len(argv) else "selftest-output"
+        del argv[i:i + 2]
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    # A .wts given on the command line (double-click via the Windows
+    # installer's file association, or "open with")
+    show_arg = next((a for a in argv[1:]
+                     if a.lower().endswith(".wts") and os.path.isfile(a)), None)
+
+    app = _App(sys.argv); app.setStyle("Fusion")
     pal = QPalette()
     pal.setColor(QPalette.ColorRole.Window,          QColor(C['bg']))
     pal.setColor(QPalette.ColorRole.WindowText,      QColor(C['text']))
@@ -6991,7 +7576,37 @@ def main():
     pal.setColor(QPalette.ColorRole.Highlight,       QColor(C['green']))
     pal.setColor(QPalette.ColorRole.HighlightedText, QColor(C['bg']))
     app.setPalette(pal); app.setStyleSheet(STYLESHEET)
-    w = MainWindow(); w.show(); sys.exit(app.exec())
+    if selftest_dir is not None:
+        sys.exit(run_selftest(selftest_dir))
+    w = MainWindow(); w.show()
+    app.main_window = w
+    if show_arg:
+        QTimer.singleShot(0, lambda: w.open_show_path(show_arg))
+    if app.pending_open:                 # macOS: Finder opened a .wts at launch
+        p = app.pending_open; app.pending_open = None
+        QTimer.singleShot(0, lambda: w.open_show_path(p))
+    sys.exit(app.exec())
+
+
+class _App(QApplication):
+    """QApplication that also handles macOS 'open this file' events (double
+    click on a .wts in Finder, or drop on the Dock icon)."""
+    def __init__(self, argv):
+        super().__init__(argv)
+        self.main_window = None
+        self.pending_open = None
+
+    def event(self, e):
+        if e.type() == QEvent.Type.FileOpen:
+            path = e.file()
+            if path and path.lower().endswith(".wts"):
+                w = self.main_window
+                if w is None:
+                    self.pending_open = path
+                elif w._ask_save():
+                    w.open_show_path(path)
+            return True
+        return super().event(e)
 
 if __name__ == "__main__":
     main()

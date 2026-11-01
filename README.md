@@ -18,7 +18,13 @@ DiGiCo-inspired: snapshots/cues, GO, Auto Update, Recall Scope, Fades, OSC/TCP c
 MIT
 
 ## Downloads
-See [Releases](../../releases) for pre-built binaries for macOS and Windows.
+See [Releases](../../releases):
+- **macOS** – `WingTheatreController-macos.dmg` (signed and notarised)
+- **Windows installer** – `WingTheatreController-windows-installer.zip` → `WingTheatreController-Setup.exe` (signed)
+- **Windows portable** – `WingTheatreController-windows-portable.zip` (unzip and run, no installation)
+- **Companion module** – `companion-module-wingtheatre.zip`
+
+What changed: [CHANGELOG.md](./CHANGELOG.md)
 
 ## User Manual
 📖 [Wing Theatre Controller Manual (PDF — click to read in browser)](./Wing-Theatre-Controller-Manual.pdf) · [Word version (.docx)](./Wing-Theatre-Controller-Manual.docx)
@@ -30,6 +36,7 @@ Full guide for sound engineers: installation, connecting to the Wing, cue lists,
 wing_theatre.py          ← Main application (Python/PyQt6)
 wingmon/wingmon.rs       ← Wing binary bridge (Rust)
 companion-module/        ← Bitfocus Companion v5 module
+installer/               ← Windows installer (Inno Setup)
 .github/workflows/       ← Automated build (macOS + Windows)
 ```
 

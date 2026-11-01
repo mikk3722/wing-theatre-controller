@@ -17,6 +17,7 @@ class WingTheatreInstance extends InstanceBase {
       autoupdate: 'false', wing_connected: 'false',
       cue_count: '0',      fading: 'false',
       selected_cue_num: '', selected_cue_name: '',
+      fade_remaining: '',
     }
     this._reconnect_timer = null
   }
@@ -44,23 +45,38 @@ class WingTheatreInstance extends InstanceBase {
   getConfigFields() {
     return [
       { type: 'textinput', id: 'host', label: 'Wing Theatre IP', width: 8, default: '127.0.0.1' },
-      { type: 'number',    id: 'port', label: 'TCP Port',        width: 4, default: 9000, min: 1024, max: 65535 },
+      // 9001 = the app's default Companion/TCP port (9000 is its OSC/UDP port)
+      { type: 'number',    id: 'port', label: 'TCP Port',        width: 4, default: 9001, min: 1024, max: 65535 },
     ]
   }
 
   _connect() {
     this._stopReconnect()
+    // Close any previous socket first, and ignore events from it: before,
+    // a config change or reconnect could leave the old connection open,
+    // using up one of the app's 4 Companion connections.
+    if (this._socket) {
+      const old = this._socket
+      this._socket = null
+      old.removeAllListeners()
+      old.on('error', () => {})
+      old.destroy()
+    }
     const host = this.config && this.config.host ? this.config.host : '127.0.0.1'
-    const port = this.config && this.config.port ? this.config.port : 9000
+    const port = this.config && this.config.port ? this.config.port : 9001
     this.updateStatus(InstanceStatus.Connecting)
-    this._socket = new net.Socket()
-    this._socket.setEncoding('utf8')
-    this._socket.connect(port, host, () => {
+    const sock = new net.Socket()
+    this._socket = sock
+    sock.setEncoding('utf8')
+    sock.setKeepAlive(true, 5000)   // notice a dead link (cable pulled, laptop asleep)
+    sock.connect(port, host, () => {
+      if (sock !== this._socket) return
       this.updateStatus(InstanceStatus.Ok)
       this._buf = ''
       this._send('GET_STATE')
     })
-    this._socket.on('data', (data) => {
+    sock.on('data', (data) => {
+      if (sock !== this._socket) return
       this._buf += data
       let nl
       while ((nl = this._buf.indexOf('\n')) !== -1) {
@@ -69,12 +85,15 @@ class WingTheatreInstance extends InstanceBase {
         if (line) this._handleLine(line)
       }
     })
-    this._socket.on('error', (err) => {
+    sock.on('error', (err) => {
+      if (sock !== this._socket) return
       this.updateStatus(InstanceStatus.ConnectionFailure, err.message)
       this._scheduleReconnect()
     })
-    this._socket.on('close', () => {
-      this.updateStatus(InstanceStatus.Disconnected)
+    sock.on('close', () => {
+      if (sock !== this._socket) return
+      if (!this._refused) this.updateStatus(InstanceStatus.Disconnected)
+      this._refused = false
       this._scheduleReconnect()
     })
   }
@@ -93,6 +112,13 @@ class WingTheatreInstance extends InstanceBase {
   }
 
   _handleLine(line) {
+    if (line.startsWith('ERROR')) {
+      // e.g. "ERROR server full (max 4 connections)"
+      this._refused = true
+      this.updateStatus(InstanceStatus.ConnectionFailure, line.slice(5).trim())
+      this.log('warn', 'Wing Theatre Controller: ' + line)
+      return
+    }
     if (!line.startsWith('STATE ')) return
     const eq = line.indexOf('=')
     if (eq < 0) return
@@ -115,6 +141,7 @@ class WingTheatreInstance extends InstanceBase {
       next_cue:  { name: 'Next — move selection down (no GO)', options: [], callback: () => this._send('NEXT') },
       prev_cue:  { name: 'Previous — move selection up (no GO)', options: [], callback: () => this._send('PREV') },
       get_state: { name: 'Request full state update', options: [], callback: () => this._send('GET_STATE') },
+      cancel_fade: { name: 'Cancel fade — all fades jump to their target', options: [], callback: () => this._send('CANCEL_FADE') },
       snap_go: {
         name: 'GO specific cue',
         options: [{ type: 'textinput', id: 'target', label: 'Cue number or name', default: '1' }],
@@ -160,6 +187,7 @@ class WingTheatreInstance extends InstanceBase {
       { variableId: 'fading',           name: 'Fade in progress (true/false)' },
       { variableId: 'selected_cue_num',  name: 'Selected cue number (cursor)' },
       { variableId: 'selected_cue_name', name: 'Selected cue name (cursor)' },
+      { variableId: 'fade_remaining',    name: 'Seconds left of the newest fade (empty when no fade)' },
     ])
     this.setVariableValues(this._state)
   }
@@ -189,6 +217,10 @@ class WingTheatreInstance extends InstanceBase {
       { type:'button', category:'Wing Theatre', name:'Previous cue (no GO)',
         style:{text:'PREV', size:'14', color:WHITE, bgcolor:DARK},
         steps:[{down:[{actionId:'prev_cue',options:{}}],up:[]}], feedbacks:[] },
+      { type:'button', category:'Wing Theatre', name:'Cancel fade',
+        style:{text:'CANCEL\nFADE\n$(wingtheatre:fade_remaining)', size:'14', color:WHITE, bgcolor:DARK},
+        steps:[{down:[{actionId:'cancel_fade',options:{}}],up:[]}],
+        feedbacks:[{feedbackId:'fading',options:{},style:{bgcolor:combineRgb(230,200,0),color:BLACK}}] },
       { type:'button', category:'Wing Theatre', name:'Wing connected indicator',
         style:{text:'WING\nCONNECTED', size:'12', color:WHITE, bgcolor:combineRgb(100,30,30)},
         steps:[{down:[],up:[]}],

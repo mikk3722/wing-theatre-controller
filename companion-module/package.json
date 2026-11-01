@@ -1,6 +1,6 @@
 {
   "name": "companion-module-wingtheatre",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Bitfocus Companion module for Wing Theatre Controller",
   "keywords": ["companion-module"],
   "main": "main.js",

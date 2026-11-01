@@ -6,6 +6,12 @@ on:
       - 'v*'
   workflow_dispatch:
 
+env:
+  # libwing is pinned to a tested commit, so an upstream change can never
+  # change wingmon or propmap.jsonl in a release without us noticing.
+  # (36d713e = libwing 1.0.6, 2026-10-30, incl. the set_int fix.)
+  LIBWING_REF: 36d713e360ea8c37f210e4bb5f3a9a161b65ba17
+
 jobs:
 
   build-wingmon-macos:
@@ -19,10 +25,12 @@ jobs:
       - name: Clone libwing and build wingmon
         run: |
           git clone https://github.com/dannyfiresnake/libwing.git
+          git -C libwing checkout -q $LIBWING_REF
           cp wingmon/wingmon.rs libwing/tools/wingmon.rs
           python3 wingmon/patch_libwing.py
           cd libwing
           cargo build --release --example wingmon
+          cargo test --release --example wingmon   # wingmon's encoder tests
           cp target/release/examples/wingmon ../wingmon-macos
           codesign --sign - --force ../wingmon-macos
       - uses: actions/upload-artifact@v4
@@ -41,10 +49,12 @@ jobs:
       - name: Clone libwing and build wingmon
         run: |
           git clone https://github.com/dannyfiresnake/libwing.git
+          git -C libwing checkout -q $env:LIBWING_REF
           Copy-Item wingmon/wingmon.rs libwing/tools/wingmon.rs
           python3 wingmon/patch_libwing.py
           cd libwing
           cargo build --release --example wingmon
+          cargo test --release --example wingmon   # wingmon's encoder tests
           Copy-Item target/release/examples/wingmon.exe ../wingmon.exe
       - uses: actions/upload-artifact@v4
         with:
@@ -67,7 +77,9 @@ jobs:
           python-version: '3.11'
 
       - name: Install Python dependencies
-        run: pip install PyQt6 python-osc pyinstaller
+        # Upper bounds: a new MAJOR release of Qt/PyInstaller can't sneak
+        # into a build unnoticed (minor/patch updates still come in).
+        run: pip install "PyQt6>=6.6,<7" "python-osc>=1.8,<2" "pyinstaller>=6.6,<7"
 
       - name: Build app
         run: |
@@ -86,36 +98,12 @@ jobs:
           echo "${{ github.ref_name }} (build ${{ github.run_number }}, $(date +%Y-%m-%d))" > version.txt
           # Copy propmap from libwing
           git clone https://github.com/dannyfiresnake/libwing.git libwing_tmp
+          git -C libwing_tmp checkout -q $LIBWING_REF
           cp libwing_tmp/src/propmap.jsonl propmap.jsonl || echo "propmap not found, skipping"
-          # DIAGNOSTIC: print sample lines to the Actions log so the exact
-          # current schema (field names) can be inspected without needing
-          # to locate the file on a local machine. Safe to remove once the
-          # propmap parsing bug is confirmed fixed.
-          echo "=== propmap.jsonl sample (first 15 lines) ==="
-          head -15 propmap.jsonl || echo "propmap.jsonl not present"
-          echo "=== propmap.jsonl EQ-related sample (first 10 matches) ==="
-          grep -m 10 '"/ch/1/eq/' propmap.jsonl || echo "no /ch/1/eq/ entries found"
-          echo "=== end propmap.jsonl sample ==="
-          # DIAGNOSTIC: full /ch/1/eq/ dump. User reports that even on the
-          # STANDARD (STD) EQ model -- which DOES have propmap entries,
-          # unlike other models -- only the TOP band recalls correctly.
-          # This checks whether propmap.jsonl is simply missing entries for
-          # bands 2+ even within STD, or whether all bands are present and
-          # the bug is elsewhere.
-          echo "=== propmap.jsonl FULL /ch/1/eq/ dump ==="
-          grep '"fullname":"/ch/1/eq/' propmap.jsonl
-          echo "=== end /ch/1/eq/ dump ==="
-          echo "=== propmap.jsonl total entries with an index field ==="
-          grep -c '"index"' propmap.jsonl || echo "0"
-          echo "=== propmap.jsonl /ch/1/gate/ entries (all models?) ==="
-          grep '"fullname":"/ch/1/gate/' propmap.jsonl | head -30
-          echo "=== propmap.jsonl /ch/1/dyn/ entries (all models?) ==="
-          grep '"fullname":"/ch/1/dyn/' propmap.jsonl | head -30
-          echo "=== propmap.jsonl /ch/1/flt/ entries (all models?) ==="
-          grep '"fullname":"/ch/1/flt/' propmap.jsonl | head -30
-          echo "=== end propmap.jsonl model-coverage diagnostic ==="
+          echo "propmap.jsonl: $(wc -l < propmap.jsonl) entries"
           rm -rf libwing_tmp
           pyinstaller \
+            --noconfirm \
             --name "Wing Theatre Controller" \
             --windowed \
             --add-data "wingmon:." \
@@ -133,6 +121,10 @@ jobs:
           plutil -replace CFBundleVersion -string "${{ github.run_number }}" "$PLIST" || true
           plutil -replace NSLocalNetworkUsageDescription -string \
             "Wing Theatre Controller needs local network access to communicate with the Behringer Wing." "$PLIST"
+          # Double-clicking a .wts show file in Finder opens it in the app
+          plutil -replace CFBundleDocumentTypes -xml \
+            '<array><dict><key>CFBundleTypeName</key><string>Wing Theatre Show</string><key>CFBundleTypeRole</key><string>Editor</string><key>LSHandlerRank</key><string>Owner</string><key>CFBundleTypeExtensions</key><array><string>wts</string></array></dict></array>' \
+            "$PLIST"
 
       # ── Code signing ────────────────────────────────────────────────────
       # With the Apple Developer secrets set in GitHub (Settings -> Secrets
@@ -198,6 +190,16 @@ jobs:
           "${SIGN[@]}" --entitlements entitlements.plist "$APP"
           codesign --verify --deep --strict --verbose=2 "$APP"
           codesign -dv "$APP" 2>&1 | grep -E "Authority|TeamIdentifier|flags"
+
+      - name: Self-test (built app)
+        timeout-minutes: 5
+        run: |
+          export QT_QPA_PLATFORM=offscreen
+          "dist/Wing Theatre Controller.app/Contents/MacOS/Wing Theatre Controller" --selftest "$RUNNER_TEMP/app-selftest" \
+            || { cat "$RUNNER_TEMP/app-selftest/selftest.txt" 2>/dev/null; echo "::error::Self-test of the built app failed"; exit 1; }
+          tail -1 "$RUNNER_TEMP/app-selftest/selftest.txt"
+          # The self-test must not have written anything into the signed bundle
+          codesign --verify --deep --strict "dist/Wing Theatre Controller.app"
 
       - name: Notarise app
         env:
@@ -284,7 +286,9 @@ jobs:
           python-version: '3.11'
 
       - name: Install Python dependencies
-        run: pip install PyQt6 python-osc pyinstaller
+        # Upper bounds: a new MAJOR release of Qt/PyInstaller can't sneak
+        # into a build unnoticed (minor/patch updates still come in).
+        run: pip install "PyQt6>=6.6,<7" "python-osc>=1.8,<2" "pyinstaller>=6.6,<7"
 
       - name: Build app
         run: |
@@ -292,9 +296,11 @@ jobs:
           "${{ github.ref_name }} (build ${{ github.run_number }}, $(Get-Date -Format 'yyyy-MM-dd'))" | Out-File -FilePath version.txt -Encoding utf8
           # Copy propmap from libwing
           git clone https://github.com/dannyfiresnake/libwing.git libwing_tmp
+          git -C libwing_tmp checkout -q $env:LIBWING_REF
           Copy-Item libwing_tmp/src/propmap.jsonl propmap.jsonl -ErrorAction SilentlyContinue
           Remove-Item libwing_tmp -Recurse -Force
           pyinstaller `
+            --noconfirm `
             --name "Wing Theatre Controller" `
             --windowed `
             --add-data "wingmon.exe;." `
@@ -346,16 +352,111 @@ jobs:
           Write-Host "$($files.Count) exe/dll/pyd files checked, $bad not validly signed"
           if ($bad -gt 0) { Write-Error "$bad file(s) not validly signed"; exit 1 }
 
-      - name: Create ZIP
+      # Start the BUILT app headless and run its self-test (see
+      # run_selftest in wing_theatre.py): catches a broken build -- missing
+      # library, missing wingmon/propmap, a crash at startup or in recall,
+      # fades, save/load or the Companion server -- before it is released.
+      - name: Self-test (built app)
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $p = Start-Process -FilePath "dist\Wing Theatre Controller\Wing Theatre Controller.exe" `
+                 -ArgumentList "--selftest","exe-selftest" -Wait -PassThru
+          if (Test-Path exe-selftest\selftest.txt) { Get-Content exe-selftest\selftest.txt }
+          if ($p.ExitCode -ne 0) { throw "Self-test of the built app failed (exit $($p.ExitCode))" }
+
+      - name: Create ZIP (portable)
         run: |
           Compress-Archive `
             -Path "dist\Wing Theatre Controller" `
-            -DestinationPath "WingTheatreController-windows.zip"
+            -DestinationPath "WingTheatreController-windows-portable.zip"
+
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress | Out-Null
+          $iscc = Get-ChildItem "C:\Program Files (x86)\Inno Setup *\ISCC.exe", "C:\Program Files\Inno Setup *\ISCC.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $iscc) { throw "Inno Setup (ISCC.exe) was not found" }
+          $ver = "0.0.0"
+          if ($env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME -match '^v?(\d+(\.\d+){0,3})$') { $ver = $Matches[1] }
+          Write-Host "Installer version: $ver"
+          & $iscc.FullName "/DMyAppVersion=$ver" "installer\wing-theatre-controller.iss"
+          if ($LASTEXITCODE -ne 0) { throw "The installer could not be built" }
+          Get-ChildItem installer-out
+
+      - name: Sign installer (Azure Artifact Signing)
+        if: env.HAS_AZURE_SIGNING == 'true'
+        uses: azure/artifact-signing-action@v2
+        with:
+          azure-tenant-id:          ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id:          ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret:      ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint:                 ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name:     ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_CERT_PROFILE }}
+          files-folder:             ${{ github.workspace }}\installer-out
+          files-folder-filter:      exe
+          file-digest:              SHA256
+          timestamp-rfc3161:        http://timestamp.acs.microsoft.com
+          timestamp-digest:         SHA256
+          description:              Wing Theatre Controller Setup
+          description-url:          https://github.com/mikk3722/wing-theatre-controller
+
+      # Install for the current user (no admin), check the Start menu entry
+      # and the .wts association, run the self-test on the INSTALLED app,
+      # then uninstall and check nothing is left behind.
+      - name: Test the installer
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          $setup = "installer-out\WingTheatreController-Setup.exe"
+          $sig = Get-AuthenticodeSignature $setup
+          if ($env:HAS_AZURE_SIGNING -eq "true" -and $sig.Status -ne "Valid") { throw "The installer is not signed correctly: $($sig.Status)" }
+          if ($sig.Status -eq "Valid") { Write-Output "::notice::Installer signed by $($sig.SignerCertificate.Subject)" }
+          $dir = Join-Path $env:LOCALAPPDATA "Programs\WTC-installer-test"
+          $p = Start-Process $setup -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/CURRENTUSER","/DIR=`"$dir`"" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Install failed ($($p.ExitCode))" }
+          $exe = Join-Path $dir "Wing Theatre Controller.exe"
+          if (-not (Test-Path $exe)) { throw "Wing Theatre Controller.exe was not installed" }
+          $assoc = (Get-ItemProperty "HKCU:\Software\Classes\WingTheatreController.Show\shell\open\command").'(default)'
+          Write-Output "Open command: $assoc"
+          if ($assoc -notlike "*Wing Theatre Controller.exe*") { throw ".wts is not associated with the app" }
+          $lnk = Get-ChildItem "$env:APPDATA\Microsoft\Windows\Start Menu\Programs" -Filter "Wing Theatre Controller.lnk" -Recurse
+          if (-not $lnk) { throw "No Start menu shortcut" }
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $t = Start-Process $exe -ArgumentList "--selftest","installed-selftest" -Wait -PassThru
+          if (Test-Path installed-selftest\selftest.txt) { Get-Content installed-selftest\selftest.txt | Select-Object -Last 1 }
+          if ($t.ExitCode -ne 0) { throw "The installed app failed its self-test" }
+          $u = Start-Process (Join-Path $dir "unins000.exe") -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait -PassThru
+          Start-Sleep -Seconds 3
+          if (Test-Path $exe) { throw "Uninstall left the app behind" }
+          if (Test-Path "HKCU:\Software\Classes\WingTheatreController.Show") { throw "Uninstall left the file association behind" }
+          Write-Output "::notice::Installer: install, Start menu, .wts association, self-test and uninstall all OK"
+
+      # The installer is delivered inside a zip (some mail/web filters block
+      # a bare .exe download); the portable version is a zip as before.
+      - name: Zip installer
+        run: |
+          Compress-Archive `
+            -Path "installer-out\WingTheatreController-Setup.exe" `
+            -DestinationPath "WingTheatreController-windows-installer.zip"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: selftest-windows
+          path: |
+            exe-selftest
+            installed-selftest
+          if-no-files-found: ignore
 
       - uses: actions/upload-artifact@v4
         with:
           name: WingTheatreController-windows
-          path: WingTheatreController-windows.zip
+          path: |
+            WingTheatreController-windows-installer.zip
+            WingTheatreController-windows-portable.zip
 
   package-companion:
     runs-on: ubuntu-latest
@@ -400,7 +501,8 @@ jobs:
             | Platform | Download |
             |---|---|
             | macOS | WingTheatreController-macos.dmg |
-            | Windows | WingTheatreController-windows.zip |
+            | Windows (installer) | WingTheatreController-windows-installer.zip -- unzip and run WingTheatreController-Setup.exe (Start menu, uninstaller, double-click .wts to open) |
+            | Windows (portable) | WingTheatreController-windows-portable.zip -- unzip anywhere and run Wing Theatre Controller.exe, no installation |
             | Companion Module | companion-module-wingtheatre.zip |
 
             Built on libwing by dannyfiresnake. Protocol by Patrick-Gilles Maillot.

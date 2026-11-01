@@ -60,9 +60,16 @@ fn print_node(tx: &mpsc::Sender<String>, prefix: &str, id: i32, val: &str) {
     }
 }
 
-/// Encode one parameter as Wing binary: d7 [4-byte hash] [compact value]
-/// Matches Wing Editor's wire format exactly.
-/// Hash bytes containing 0xdf are escaped with 0xde (Wing protocol requirement).
+/// Encode one parameter as Wing binary: d7 [4-byte hash] [compact value],
+/// following the token table in Behringer's "WING Remote Protocols"
+/// (Binary Stream Format, channel 2):
+///   0x00..0x3f      int 0..63 (single byte)
+///   0x40..0x7f      NODE INDEX 1..64 -- NOT a value! (an int 64..127 sent
+///                   as one byte here would navigate, not set anything)
+///   0x80..0xbf      string of 1..64 bytes, 0xd0 empty string,
+///   0xd1 len        string of 1..256 bytes
+///   0xd3 word       int16,  0xd4 long int32,  0xd5 long float32
+/// The finished bytes are passed through escape_df() -- see there.
 fn encode_param(path: &str, val: &str) -> Option<Vec<u8>> {
     // Hash-direct addressing: paths for ambiguous (model-dependent)
     // parameters carry their raw hash embedded as a "#xxxxxxxx" suffix
@@ -77,50 +84,103 @@ fn encode_param(path: &str, val: &str) -> Option<Vec<u8>> {
     } else {
         WingConsole::name_to_id(path)?
     };
-    let id_bytes = id.to_be_bytes();
 
-    // Escape 0xdf bytes in hash (Wing protocol)
-    let mut buf = vec![0xd7u8];
-    for b in id_bytes {
-        if b == 0xdf { buf.push(0xde); }
-        buf.push(b);
-    }
+    let mut raw = vec![0xd7u8];
+    raw.extend_from_slice(&id.to_be_bytes());
 
     let val = val.trim();
 
-    // Try integer
     if let Ok(i) = val.parse::<i32>() {
-        if i >= 0 && i <= 127 {
-            buf.push(i as u8);
+        if (0..=0x3f).contains(&i) {
+            raw.push(i as u8);
+        } else if (-32768..=32767).contains(&i) {
+            let b = (i as i16).to_be_bytes();
+            raw.extend_from_slice(&[0xd3, b[0], b[1]]);
         } else {
             let b = i.to_be_bytes();
-            buf.extend_from_slice(&[0xd4, b[0], b[1], b[2], b[3]]);
+            raw.extend_from_slice(&[0xd4, b[0], b[1], b[2], b[3]]);
         }
-        return Some(buf);
+        return Some(escape_df(raw));
     }
 
-    // Try float
     if let Ok(f) = val.parse::<f32>() {
         let b = f.to_be_bytes();
-        buf.extend_from_slice(&[0xd5, b[0], b[1], b[2], b[3]]);
-        return Some(buf);
+        raw.extend_from_slice(&[0xd5, b[0], b[1], b[2], b[3]]);
+        return Some(escape_df(raw));
     }
 
     // String
     let bytes = val.as_bytes();
     let len = bytes.len();
     if len == 0 {
-        buf.push(0xd0);
+        raw.push(0xd0);
     } else if len <= 64 {
-        buf.push(0x7f + len as u8);
+        raw.push(0x7f + len as u8);
     } else if len <= 256 {
-        buf.push(0xd1);
-        buf.push((len - 1) as u8);
+        raw.push(0xd1);
+        raw.push((len - 1) as u8);
     } else {
         return None; // too long
     }
-    buf.extend_from_slice(bytes);
-    Some(buf)
+    raw.extend_from_slice(bytes);
+    Some(escape_df(raw))
+}
+
+/// 0xdf is the escape byte of Wing's native protocol: 0xdf followed by
+/// 0xd0..0xdd switches the communication channel. A 0xdf that is DATA --
+/// inside a hash, an int, a float or a string -- must therefore be sent as
+/// 0xdf 0xde ("literal 0xdf"), or Wing may read it together with the next
+/// byte as a channel switch (e.g. a float ending in 0xdf followed by the
+/// next parameter's 0xd7 = "switch to channel 7"), and every following
+/// parameter in that burst is lost. Sending 0xdf 0xde for every data 0xdf
+/// is always correct (WING Remote Protocols, sample transmit/receive
+/// routines). Previously only hash bytes were escaped, and in the wrong
+/// order (0xde 0xdf), which misaligned the hash itself.
+fn escape_df(raw: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len() + 4);
+    for b in raw {
+        out.push(b);
+        if b == 0xdf {
+            out.push(0xde);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod encode_tests {
+    use super::*;
+
+    #[test]
+    fn small_ints_are_one_byte_only_up_to_63() {
+        let e = encode_param("#01020304", "63").unwrap();
+        assert_eq!(e, vec![0xd7, 1, 2, 3, 4, 63]);
+        let e = encode_param("#01020304", "64").unwrap();
+        assert_eq!(e, vec![0xd7, 1, 2, 3, 4, 0xd3, 0x00, 64]);
+        let e = encode_param("#01020304", "127").unwrap();
+        assert_eq!(e, vec![0xd7, 1, 2, 3, 4, 0xd3, 0x00, 127]);
+        let e = encode_param("#01020304", "-1").unwrap();
+        assert_eq!(e, vec![0xd7, 1, 2, 3, 4, 0xd3, 0xff, 0xff]);
+        let e = encode_param("#01020304", "100000").unwrap();
+        assert_eq!(e, vec![0xd7, 1, 2, 3, 4, 0xd4, 0x00, 0x01, 0x86, 0xa0]);
+    }
+
+    #[test]
+    fn df_in_hash_and_value_is_escaped() {
+        let e = encode_param("#01df0304", "1").unwrap();
+        assert_eq!(e, vec![0xd7, 1, 0xdf, 0xde, 3, 4, 1]);
+        // float whose last byte is 0xdf
+        let f = f32::from_be_bytes([0x40, 0x49, 0x0f, 0xdf]);
+        let e = encode_param("#01020304", &format!("{}", f)).unwrap();
+        assert_eq!(&e[..6], &[0xd7, 1, 2, 3, 4, 0xd5]);
+        assert_eq!(&e[6..], &[0x40, 0x49, 0x0f, 0xdf, 0xde]);
+    }
+
+    #[test]
+    fn strings() {
+        assert_eq!(encode_param("#01020304", "").unwrap(), vec![0xd7, 1, 2, 3, 4, 0xd0]);
+        assert_eq!(encode_param("#01020304", "BD").unwrap(), vec![0xd7, 1, 2, 3, 4, 0x81, b'B', b'D']);
+    }
 }
 
 fn main() -> Result<(), libwing::Error> {
@@ -190,14 +250,28 @@ fn main() -> Result<(), libwing::Error> {
                 if event_wing.request_node_data(id).is_ok() { pending += 1; }
             }
         }
+        // A read error used to be ignored here, so a connection that died
+        // mid-sync left wingmon spinning in this loop forever (100% CPU,
+        // never SYNC_COMPLETE, never reported as disconnected). Give up
+        // after a few consecutive errors so the app sees the disconnect.
+        let mut errors = 0u32;
         while pending > 0 {
             match event_wing.read() {
-                Ok(WingResponse::RequestEnd)         => { pending -= 1; }
+                Ok(WingResponse::RequestEnd)         => { pending -= 1; errors = 0; }
                 Ok(WingResponse::NodeData(id, data)) => {
                     print_node(&tx_out, "DATA ", id, &data.get_string());
                     total += 1;
+                    errors = 0;
                 }
-                Ok(_) | Err(_) => {}
+                Ok(_) => { errors = 0; }
+                Err(e) => {
+                    errors += 1;
+                    eprintln!("[wingmon] SYNC read error ({}): {}", errors, e);
+                    if errors >= 3 {
+                        eprintln!("[wingmon] SYNC failed - Wing not responding");
+                        return Err(e);
+                    }
+                }
             }
         }
     }
@@ -217,11 +291,8 @@ fn main() -> Result<(), libwing::Error> {
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
             let Ok(l) = line else { break };
-            // Diagnostic: log first word of every command received on stdin,
-            // so we can confirm Python -> wingmon delivery is working.
-            let verb = l.trim().split(' ').next().unwrap_or("");
-            let len = l.len();
-            eprintln!("[wingmon] stdin recv: {} ({} bytes)", verb, len);
+            // (No per-command log line here any more: during a fade this
+            // logged 40 lines a second into the status bar and log file.)
             tx_stdin.send(l).ok();
         }
         eprintln!("[wingmon] stdin EOF - internal keepalive maintains connection");
@@ -314,7 +385,10 @@ fn main() -> Result<(), libwing::Error> {
                     // is enabled on this connection so each write goes out
                     // immediately rather than waiting on Nagle's algorithm.
                     const CHUNK: usize = 4;
-                    let all_params: Vec<&str> = params.split(',').collect();
+                    // Parameters are separated by the ASCII unit separator
+                    // (0x1f), not a comma, so names/texts containing a comma
+                    // are recalled intact.
+                    let all_params: Vec<&str> = params.split('\u{1f}').collect();
                     let mut sent_bytes = 0usize;
                     let mut chunk_count = 0usize;
                     let mut had_error = false;
@@ -350,9 +424,11 @@ fn main() -> Result<(), libwing::Error> {
 
                     if had_error {
                         reconnect = true;
-                    } else {
-                        eprintln!("[wingmon] BATCH_SET sent: {} bytes in {} bursts, {}ms",
-                            sent_bytes, chunk_count, t0.elapsed().as_millis());
+                    } else if all_params.len() > 50 {
+                        // Logged for cue recalls only -- not for every fade
+                        // tick (40 a second), which only flooded the log.
+                        eprintln!("[wingmon] BATCH_SET sent: {} params, {} bytes in {} bursts, {}ms",
+                            all_params.len(), sent_bytes, chunk_count, t0.elapsed().as_millis());
                     }
                 } else if let Some(rest) = trimmed.strip_prefix("SET ") {
                     if let Some(space) = rest.find(' ') {
